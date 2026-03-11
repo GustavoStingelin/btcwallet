@@ -252,7 +252,7 @@ func (q *Queries) InsertWalletSyncState(ctx context.Context, arg InsertWalletSyn
 	return err
 }
 
-const ListWallets = `-- name: ListWallets :many
+const ListWalletsFirstPage = `-- name: ListWalletsFirstPage :many
 SELECT
     w.id,
     w.wallet_name,
@@ -272,9 +272,10 @@ LEFT JOIN wallet_sync_states AS s ON w.id = s.wallet_id
 LEFT JOIN blocks AS b_synced ON s.synced_height = b_synced.block_height
 LEFT JOIN blocks AS b_birthday ON s.birthday_height = b_birthday.block_height
 ORDER BY w.id
+LIMIT $1::BIGINT
 `
 
-type ListWalletsRow struct {
+type ListWalletsFirstPageRow struct {
 	ID                     int64
 	WalletName             string
 	IsImported             bool
@@ -290,15 +291,102 @@ type ListWalletsRow struct {
 	BirthdayBlockTimestamp sql.NullInt64
 }
 
-func (q *Queries) ListWallets(ctx context.Context) ([]ListWalletsRow, error) {
-	rows, err := q.query(ctx, q.listWalletsStmt, ListWallets)
+// Lists the first page of wallets ordered by wallet ID.
+// Returns up to page_limit rows.
+func (q *Queries) ListWalletsFirstPage(ctx context.Context, pageLimit int64) ([]ListWalletsFirstPageRow, error) {
+	rows, err := q.query(ctx, q.listWalletsFirstPageStmt, ListWalletsFirstPage, pageLimit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []ListWalletsRow
+	var items []ListWalletsFirstPageRow
 	for rows.Next() {
-		var i ListWalletsRow
+		var i ListWalletsFirstPageRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.WalletName,
+			&i.IsImported,
+			&i.ManagerVersion,
+			&i.IsWatchOnly,
+			&i.SyncedHeight,
+			&i.BirthdayHeight,
+			&i.BirthdayTimestamp,
+			&i.UpdatedAt,
+			&i.SyncedBlockHash,
+			&i.SyncedBlockTimestamp,
+			&i.BirthdayBlockHash,
+			&i.BirthdayBlockTimestamp,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const ListWalletsNextPage = `-- name: ListWalletsNextPage :many
+SELECT
+    w.id,
+    w.wallet_name,
+    w.is_imported,
+    w.manager_version,
+    w.is_watch_only,
+    s.synced_height,
+    s.birthday_height,
+    s.birthday_timestamp,
+    s.updated_at,
+    b_synced.header_hash AS synced_block_hash,
+    b_synced.block_timestamp AS synced_block_timestamp,
+    b_birthday.header_hash AS birthday_block_hash,
+    b_birthday.block_timestamp AS birthday_block_timestamp
+FROM wallets AS w
+LEFT JOIN wallet_sync_states AS s ON w.id = s.wallet_id
+LEFT JOIN blocks AS b_synced ON s.synced_height = b_synced.block_height
+LEFT JOIN blocks AS b_birthday ON s.birthday_height = b_birthday.block_height
+WHERE w.id > $1::BIGINT
+ORDER BY w.id
+LIMIT $2::BIGINT
+`
+
+type ListWalletsNextPageParams struct {
+	CursorID  int64
+	PageLimit int64
+}
+
+type ListWalletsNextPageRow struct {
+	ID                     int64
+	WalletName             string
+	IsImported             bool
+	ManagerVersion         int32
+	IsWatchOnly            bool
+	SyncedHeight           sql.NullInt32
+	BirthdayHeight         sql.NullInt32
+	BirthdayTimestamp      sql.NullTime
+	UpdatedAt              sql.NullTime
+	SyncedBlockHash        []byte
+	SyncedBlockTimestamp   sql.NullInt64
+	BirthdayBlockHash      []byte
+	BirthdayBlockTimestamp sql.NullInt64
+}
+
+// Lists the next page of wallets ordered by wallet ID, starting
+// strictly after cursor_id.
+// Returns up to page_limit rows.
+func (q *Queries) ListWalletsNextPage(ctx context.Context, arg ListWalletsNextPageParams) ([]ListWalletsNextPageRow, error) {
+	rows, err := q.query(ctx, q.listWalletsNextPageStmt, ListWalletsNextPage, arg.CursorID, arg.PageLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListWalletsNextPageRow
+	for rows.Next() {
+		var i ListWalletsNextPageRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.WalletName,

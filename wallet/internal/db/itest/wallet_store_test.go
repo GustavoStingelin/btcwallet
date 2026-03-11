@@ -3,10 +3,12 @@
 package itest
 
 import (
+	"math"
 	"testing"
 	"time"
 
 	"github.com/btcsuite/btcwallet/wallet/internal/db"
+	"github.com/btcsuite/btcwallet/wallet/internal/db/page"
 	"github.com/stretchr/testify/require"
 )
 
@@ -152,9 +154,13 @@ func TestListWallets(t *testing.T) {
 	store := NewTestStore(t)
 
 	// Initially empty.
-	wallets, err := store.ListWallets(t.Context())
-	require.NoError(t, err)
-	require.Empty(t, wallets)
+	query := db.ListWalletsQuery{
+		Page: page.Request[uint32]{}.WithSize(2),
+	}
+
+	for w, err := range store.IterWallets(t.Context(), query) {
+		require.Failf(t, "unexpected wallet", "wallet=%v err=%v", w, err)
+	}
 
 	// Create three wallets.
 	names := []string{"wallet-1", "wallet-2", "wallet-3"}
@@ -164,8 +170,11 @@ func TestListWallets(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	wallets, err = store.ListWallets(t.Context())
-	require.NoError(t, err)
+	var wallets []db.WalletInfo
+	for w, err := range store.IterWallets(t.Context(), query) {
+		require.NoError(t, err)
+		wallets = append(wallets, w)
+	}
 	require.Len(t, wallets, 3)
 
 	// Verify all names are present.
@@ -174,6 +183,452 @@ func TestListWallets(t *testing.T) {
 		walletsName[i] = w.Name
 	}
 	require.ElementsMatch(t, names, walletsName)
+}
+
+// TestListWalletsDeferredExhaustion verifies that ListWallets with deferred
+// exhaustion (the default mode) paginates correctly and requires an extra
+// empty-page fetch to confirm end-of-list.
+func TestListWalletsDeferredExhaustion(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+
+	names := []string{"wallet-1", "wallet-2", "wallet-3", "wallet-4"}
+	for _, name := range names {
+		params := CreateWalletParamsFixture(name)
+		_, err := store.CreateWallet(t.Context(), params)
+		require.NoError(t, err)
+	}
+
+	query := db.ListWalletsQuery{
+		Page: page.Request[uint32]{}.WithSize(2),
+	}
+
+	page1, err := store.ListWallets(t.Context(), query)
+	require.NoError(t, err)
+	require.Len(t, page1.Items, 2)
+	require.NotNil(t, page1.LastCursor)
+	require.Equal(t, page1.Items[1].ID, *page1.LastCursor)
+
+	query.Page = query.Page.WithCursor(*page1.LastCursor)
+	page2, err := store.ListWallets(t.Context(), query)
+	require.NoError(t, err)
+	require.Len(t, page2.Items, 2)
+	require.NotNil(t, page2.LastCursor)
+	require.Equal(t, page2.Items[1].ID, *page2.LastCursor)
+
+	query.Page = query.Page.WithCursor(*page2.LastCursor)
+	page3, err := store.ListWallets(t.Context(), query)
+	require.NoError(t, err)
+	require.Empty(t, page3.Items)
+	require.Nil(t, page3.LastCursor)
+
+	paged := append([]db.WalletInfo{}, page1.Items...)
+	paged = append(paged, page2.Items...)
+	require.Len(t, paged, len(names))
+
+	pagedNames := make([]string, len(paged))
+	for i, wallet := range paged {
+		pagedNames[i] = wallet.Name
+	}
+	require.Equal(t, names, pagedNames)
+}
+
+// TestListWalletsEarlyExhaustion verifies that ListWallets with early
+// exhaustion mode correctly reports HasMore without requiring an extra
+// round-trip.
+func TestListWalletsEarlyExhaustion(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+
+	names := []string{"wallet-1", "wallet-2", "wallet-3", "wallet-4"}
+	for _, name := range names {
+		params := CreateWalletParamsFixture(name)
+		_, err := store.CreateWallet(t.Context(), params)
+		require.NoError(t, err)
+	}
+
+	query := db.ListWalletsQuery{
+		Page: page.Request[uint32]{}.
+			WithSize(2).
+			WithEarlyExhaustion(),
+	}
+
+	page1, err := store.ListWallets(t.Context(), query)
+	require.NoError(t, err)
+	require.Len(t, page1.Items, 2)
+	require.NotNil(t, page1.LastCursor)
+	require.Equal(t, page1.Items[1].ID, *page1.LastCursor)
+	require.True(t, page1.HasMore)
+
+	query.Page = query.Page.WithCursor(*page1.LastCursor)
+	page2, err := store.ListWallets(t.Context(), query)
+	require.NoError(t, err)
+	require.Len(t, page2.Items, 2)
+	require.NotNil(t, page2.LastCursor)
+	require.Equal(t, page2.Items[1].ID, *page2.LastCursor)
+	require.False(t, page2.HasMore)
+
+	query.Page = query.Page.WithCursor(page2.Items[len(page2.Items)-1].ID)
+	page3, err := store.ListWallets(t.Context(), query)
+	require.NoError(t, err)
+	require.Empty(t, page3.Items)
+	require.Nil(t, page3.LastCursor)
+	require.False(t, page3.HasMore)
+
+	paged := append([]db.WalletInfo{}, page1.Items...)
+	paged = append(paged, page2.Items...)
+	require.Len(t, paged, len(names))
+
+	pagedNames := make([]string, len(paged))
+	for i, wallet := range paged {
+		pagedNames[i] = wallet.Name
+	}
+	require.Equal(t, names, pagedNames)
+}
+
+// TestIterWallets verifies that IterWallets yields the same wallets in the
+// same order as manual cursor-based pagination.
+func TestIterWallets(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+
+	names := []string{"wallet-1", "wallet-2", "wallet-3", "wallet-4"}
+	for _, name := range names {
+		params := CreateWalletParamsFixture(name)
+		_, err := store.CreateWallet(t.Context(), params)
+		require.NoError(t, err)
+	}
+
+	query := db.ListWalletsQuery{
+		Page: page.Request[uint32]{}.WithSize(2),
+	}
+	expected := flattenWalletPages(collectWalletPages(t, store, query))
+
+	iterWallets := make([]db.WalletInfo, 0, len(expected))
+	for wallet, err := range store.IterWallets(t.Context(), query) {
+		require.NoError(t, err)
+		iterWallets = append(iterWallets, wallet)
+	}
+
+	require.Equal(t, expected, iterWallets)
+}
+
+// TestIterWalletsEarlyExhaustion verifies that IterWallets with early
+// exhaustion produces the same results as manual pagination and correctly
+// signals end-of-list.
+func TestIterWalletsEarlyExhaustion(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+
+	names := []string{"wallet-1", "wallet-2", "wallet-3", "wallet-4"}
+	for _, name := range names {
+		params := CreateWalletParamsFixture(name)
+		_, err := store.CreateWallet(t.Context(), params)
+		require.NoError(t, err)
+	}
+
+	query := db.ListWalletsQuery{
+		Page: page.Request[uint32]{}.
+			WithSize(2).
+			WithEarlyExhaustion(),
+	}
+
+	pages := collectWalletPages(t, store, query)
+	require.Len(t, pages, 2)
+	require.True(t, pages[0].HasMore)
+	require.False(t, pages[1].HasMore)
+
+	expected := flattenWalletPages(pages)
+
+	iterWallets := make([]db.WalletInfo, 0, len(expected))
+	for wallet, err := range store.IterWallets(t.Context(), query) {
+		require.NoError(t, err)
+		iterWallets = append(iterWallets, wallet)
+	}
+
+	require.Equal(t, expected, iterWallets)
+}
+
+// TestListWalletsPagedFromCursor verifies that ListWallets can resume
+// pagination from a specific cursor position, returning only wallets after
+// that cursor.
+func TestListWalletsPagedFromCursor(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+
+	names := []string{"wallet-1", "wallet-2", "wallet-3", "wallet-4"}
+	created := make([]*db.WalletInfo, 0, len(names))
+	for _, name := range names {
+		params := CreateWalletParamsFixture(name)
+		wallet, err := store.CreateWallet(t.Context(), params)
+		require.NoError(t, err)
+		created = append(created, wallet)
+	}
+
+	query := db.ListWalletsQuery{
+		Page: page.Request[uint32]{}.
+			WithSize(2).
+			WithEarlyExhaustion().
+			WithCursor(created[1].ID),
+	}
+
+	pageResult, err := store.ListWallets(t.Context(), query)
+	require.NoError(t, err)
+	require.Len(t, pageResult.Items, 2)
+	require.Equal(t, names[2], pageResult.Items[0].Name)
+	require.Equal(t, names[3], pageResult.Items[1].Name)
+	require.NotNil(t, pageResult.LastCursor)
+	require.False(t, pageResult.HasMore)
+
+	query.Page = query.Page.WithCursor(created[3].ID)
+	pageResult, err = store.ListWallets(t.Context(), query)
+	require.NoError(t, err)
+	require.Empty(t, pageResult.Items)
+	require.Nil(t, pageResult.LastCursor)
+	require.False(t, pageResult.HasMore)
+}
+
+// TestListWalletsPagedWithSyncMetadata verifies that paginated wallet
+// listings include sync metadata such as synced-to block and birthday block.
+func TestListWalletsPagedWithSyncMetadata(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+	queries := store.Queries()
+
+	birthday1 := time.Now().UTC().Add(-48 * time.Hour)
+	birthday2 := time.Now().UTC().Add(-24 * time.Hour)
+
+	params1 := CreateWalletParamsFixture("wallet-sync-1")
+	params1.Birthday = birthday1
+	wallet1, err := store.CreateWallet(t.Context(), params1)
+	require.NoError(t, err)
+
+	params2 := CreateWalletParamsFixture("wallet-sync-2")
+	params2.Birthday = birthday2
+	wallet2, err := store.CreateWallet(t.Context(), params2)
+	require.NoError(t, err)
+
+	block1 := CreateBlockFixture(t, queries, 100)
+	block2 := CreateBlockFixture(t, queries, 101)
+
+	err = store.UpdateWallet(t.Context(), db.UpdateWalletParams{
+		WalletID:      wallet1.ID,
+		SyncedTo:      &block2,
+		BirthdayBlock: &block1,
+	})
+	require.NoError(t, err)
+
+	err = store.UpdateWallet(t.Context(), db.UpdateWalletParams{
+		WalletID:      wallet2.ID,
+		SyncedTo:      &block2,
+		BirthdayBlock: &block1,
+	})
+	require.NoError(t, err)
+
+	query := db.ListWalletsQuery{
+		Page: page.Request[uint32]{}.
+			WithSize(1).
+			WithEarlyExhaustion(),
+	}
+
+	page1, err := store.ListWallets(t.Context(), query)
+	require.NoError(t, err)
+	require.Len(t, page1.Items, 1)
+	require.NotNil(t, page1.Items[0].SyncedTo)
+	require.NotNil(t, page1.Items[0].BirthdayBlock)
+	require.False(t, page1.Items[0].Birthday.IsZero())
+	require.NotNil(t, page1.LastCursor)
+	require.True(t, page1.HasMore)
+
+	query.Page = query.Page.WithCursor(*page1.LastCursor)
+	page2, err := store.ListWallets(t.Context(), query)
+	require.NoError(t, err)
+	require.Len(t, page2.Items, 1)
+	require.NotNil(t, page2.Items[0].SyncedTo)
+	require.NotNil(t, page2.Items[0].BirthdayBlock)
+	require.False(t, page2.Items[0].Birthday.IsZero())
+	require.NotNil(t, page2.LastCursor)
+	require.False(t, page2.HasMore)
+}
+
+// TestListWalletsDeterministicPagination verifies stable page ordering and
+// next-cursor behavior for multi-page wallet listings.
+func TestListWalletsDeterministicPagination(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+	names := []string{
+		"wallet-page-1",
+		"wallet-page-2",
+		"wallet-page-3",
+		"wallet-page-4",
+		"wallet-page-5",
+	}
+
+	for _, name := range names {
+		_, err := store.CreateWallet(
+			t.Context(), CreateWalletParamsFixture(name),
+		)
+		require.NoError(t, err)
+	}
+
+	pages := collectWalletPages(t, store, db.ListWalletsQuery{
+		Page: page.Request[uint32]{}.
+			WithSize(2).
+			WithEarlyExhaustion(),
+	})
+	require.Len(t, pages, 3)
+	require.Len(t, pages[0].Items, 2)
+	require.Len(t, pages[1].Items, 2)
+	require.Len(t, pages[2].Items, 1)
+	require.NotNil(t, pages[0].LastCursor)
+	require.True(t, pages[0].HasMore)
+	require.NotNil(t, pages[1].LastCursor)
+	require.True(t, pages[1].HasMore)
+	require.NotNil(t, pages[2].LastCursor)
+	require.False(t, pages[2].HasMore)
+
+	wallets := flattenWalletPages(pages)
+	require.Len(t, wallets, len(names))
+
+	collectedNames := make([]string, len(wallets))
+	for i, wallet := range wallets {
+		if i > 0 {
+			require.Less(t, wallets[i-1].ID, wallet.ID)
+		}
+
+		collectedNames[i] = wallet.Name
+	}
+
+	require.Equal(t, names, collectedNames)
+	require.Equal(t, wallets[1].ID, *pages[0].LastCursor)
+	require.Equal(t, wallets[3].ID, *pages[1].LastCursor)
+}
+
+// TestListWalletsBoundaryInsertTradeoff verifies inserts after the cursor sort
+// point appear on later pages while boundary inserts remain a moving-dataset
+// tradeoff.
+func TestListWalletsBoundaryInsertTradeoff(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+	for _, name := range []string{"wallet-a", "wallet-b", "wallet-c"} {
+		_, err := store.CreateWallet(
+			t.Context(), CreateWalletParamsFixture(name),
+		)
+		require.NoError(t, err)
+	}
+
+	query := db.ListWalletsQuery{
+		Page: page.Request[uint32]{}.
+			WithSize(2).
+			WithEarlyExhaustion(),
+	}
+	page1, err := store.ListWallets(t.Context(), query)
+	require.NoError(t, err)
+	require.Len(t, page1.Items, 2)
+	require.NotNil(t, page1.LastCursor)
+	require.True(t, page1.HasMore)
+
+	// Boundary-insert tradeoff: rows inserted between page N and page N+1
+	// fetches that sort at or before the page N cursor boundary are not
+	// guaranteed to appear on page N+1. This is a known moving-dataset
+	// property, not a bug. Rows inserted after the cursor sort point will
+	// appear on subsequent pages as expected.
+	inserted, err := store.CreateWallet(
+		t.Context(), CreateWalletParamsFixture("wallet-d"),
+	)
+	require.NoError(t, err)
+
+	query.Page = query.Page.WithCursor(*page1.LastCursor)
+	page2, err := store.ListWallets(t.Context(), query)
+	require.NoError(t, err)
+	require.Len(t, page2.Items, 2)
+	require.Equal(t, "wallet-c", page2.Items[0].Name)
+	require.Equal(t, inserted.ID, page2.Items[1].ID)
+	require.Equal(t, "wallet-d", page2.Items[1].Name)
+	require.NotNil(t, page2.LastCursor)
+	require.False(t, page2.HasMore)
+}
+
+// TestListWalletsCursorEdges verifies stale and zero-value cursors produce
+// deterministic page results.
+func TestListWalletsCursorEdges(t *testing.T) {
+	t.Parallel()
+
+	store := NewTestStore(t)
+	names := []string{"wallet-1", "wallet-2", "wallet-3"}
+	for _, name := range names {
+		_, err := store.CreateWallet(
+			t.Context(), CreateWalletParamsFixture(name),
+		)
+		require.NoError(t, err)
+	}
+
+	stalePage, err := store.ListWallets(t.Context(), db.ListWalletsQuery{
+		Page: page.Request[uint32]{}.
+			WithSize(2).
+			WithCursor(math.MaxUint32),
+	})
+	require.NoError(t, err)
+	require.Empty(t, stalePage.Items)
+	require.Nil(t, stalePage.LastCursor)
+
+	zeroPage, err := store.ListWallets(t.Context(), db.ListWalletsQuery{
+		Page: page.Request[uint32]{}.
+			WithSize(2).
+			WithCursor(0),
+	})
+	require.NoError(t, err)
+	require.Len(t, zeroPage.Items, 2)
+	require.Equal(t, names[0], zeroPage.Items[0].Name)
+	require.Equal(t, names[1], zeroPage.Items[1].Name)
+	require.NotNil(t, zeroPage.LastCursor)
+}
+
+// collectWalletPages collects paginated wallet results by iterating
+// through all pages from ListWallets, using cursor pagination until
+// HasMore is false.
+func collectWalletPages(t *testing.T, store db.WalletStore,
+	query db.ListWalletsQuery) []page.Result[db.WalletInfo, uint32] {
+	t.Helper()
+
+	pages := make([]page.Result[db.WalletInfo, uint32], 0)
+	for {
+		pageResult, err := store.ListWallets(t.Context(), query)
+		require.NoError(t, err)
+		pages = append(pages, pageResult)
+
+		if !pageResult.HasMore {
+			return pages
+		}
+
+		query.Page = query.Page.WithCursor(*pageResult.LastCursor)
+	}
+}
+
+// flattenWalletPages flattens paginated wallet results into a single
+// slice containing all wallets from all pages.
+func flattenWalletPages(
+	pages []page.Result[db.WalletInfo, uint32]) []db.WalletInfo {
+
+	count := 0
+	for i := range pages {
+		count += len(pages[i].Items)
+	}
+
+	wallets := make([]db.WalletInfo, 0, count)
+	for i := range pages {
+		wallets = append(wallets, pages[i].Items...)
+	}
+
+	return wallets
 }
 
 // TestUpdateWallet_SyncedTo checks that updating the wallet's synced-to block

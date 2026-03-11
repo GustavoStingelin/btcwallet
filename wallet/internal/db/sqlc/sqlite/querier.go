@@ -439,7 +439,13 @@ type Querier interface {
 	// - Treats min/max confirmations as optional filters so callers can
 	//   distinguish "not set" from an explicit zero-conf request.
 	ListUtxos(ctx context.Context, arg ListUtxosParams) ([]ListUtxosRow, error)
-	ListWallets(ctx context.Context) ([]ListWalletsRow, error)
+	// Lists the first page of wallets ordered by wallet ID.
+	// Returns up to page_limit rows.
+	ListWalletsFirstPage(ctx context.Context, pageLimit int64) ([]ListWalletsFirstPageRow, error)
+	// Lists the next page of wallets ordered by wallet ID, starting
+	// strictly after cursor_id.
+	// Returns up to page_limit rows.
+	ListWalletsNextPage(ctx context.Context, arg ListWalletsNextPageParams) ([]ListWalletsNextPageRow, error)
 	// Marks a wallet-owned UTXO as spent by a transaction.
 	//
 	// How:

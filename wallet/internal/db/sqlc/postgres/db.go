@@ -231,8 +231,11 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.listUtxosStmt, err = db.PrepareContext(ctx, ListUtxos); err != nil {
 		return nil, fmt.Errorf("error preparing query ListUtxos: %w", err)
 	}
-	if q.listWalletsStmt, err = db.PrepareContext(ctx, ListWallets); err != nil {
-		return nil, fmt.Errorf("error preparing query ListWallets: %w", err)
+	if q.listWalletsFirstPageStmt, err = db.PrepareContext(ctx, ListWalletsFirstPage); err != nil {
+		return nil, fmt.Errorf("error preparing query ListWalletsFirstPage: %w", err)
+	}
+	if q.listWalletsNextPageStmt, err = db.PrepareContext(ctx, ListWalletsNextPage); err != nil {
+		return nil, fmt.Errorf("error preparing query ListWalletsNextPage: %w", err)
 	}
 	if q.lockAccountScopeStmt, err = db.PrepareContext(ctx, LockAccountScope); err != nil {
 		return nil, fmt.Errorf("error preparing query LockAccountScope: %w", err)
@@ -614,9 +617,14 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing listUtxosStmt: %w", cerr)
 		}
 	}
-	if q.listWalletsStmt != nil {
-		if cerr := q.listWalletsStmt.Close(); cerr != nil {
-			err = fmt.Errorf("error closing listWalletsStmt: %w", cerr)
+	if q.listWalletsFirstPageStmt != nil {
+		if cerr := q.listWalletsFirstPageStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing listWalletsFirstPageStmt: %w", cerr)
+		}
+	}
+	if q.listWalletsNextPageStmt != nil {
+		if cerr := q.listWalletsNextPageStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing listWalletsNextPageStmt: %w", cerr)
 		}
 	}
 	if q.lockAccountScopeStmt != nil {
@@ -777,7 +785,8 @@ type Queries struct {
 	listTransactionsByHeightRangeStmt           *sql.Stmt
 	listUnminedTransactionsStmt                 *sql.Stmt
 	listUtxosStmt                               *sql.Stmt
-	listWalletsStmt                             *sql.Stmt
+	listWalletsFirstPageStmt                    *sql.Stmt
+	listWalletsNextPageStmt                     *sql.Stmt
 	lockAccountScopeStmt                        *sql.Stmt
 	markUtxoSpentStmt                           *sql.Stmt
 	releaseUtxoLeaseStmt                        *sql.Stmt
@@ -863,7 +872,8 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		listTransactionsByHeightRangeStmt:           q.listTransactionsByHeightRangeStmt,
 		listUnminedTransactionsStmt:                 q.listUnminedTransactionsStmt,
 		listUtxosStmt:                               q.listUtxosStmt,
-		listWalletsStmt:                             q.listWalletsStmt,
+		listWalletsFirstPageStmt:                    q.listWalletsFirstPageStmt,
+		listWalletsNextPageStmt:                     q.listWalletsNextPageStmt,
 		lockAccountScopeStmt:                        q.lockAccountScopeStmt,
 		markUtxoSpentStmt:                           q.markUtxoSpentStmt,
 		releaseUtxoLeaseStmt:                        q.releaseUtxoLeaseStmt,

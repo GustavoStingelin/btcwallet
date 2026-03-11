@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"iter"
 
+	"github.com/btcsuite/btcwallet/wallet/internal/db/page"
 	sqlcpg "github.com/btcsuite/btcwallet/wallet/internal/db/sqlc/postgres"
 )
 
@@ -140,41 +142,42 @@ func (s *PostgresStore) GetWallet(ctx context.Context,
 	})
 }
 
-// ListWallets returns a slice of WalletInfo for all wallets stored in
-// the database. It returns an empty slice if no wallets are found, or
-// an error if the retrieval fails.
-func (s *PostgresStore) ListWallets(ctx context.Context) ([]WalletInfo,
-	error) {
+// ListWallets returns a page of wallets matching the given query.
+func (s *PostgresStore) ListWallets(ctx context.Context,
+	query ListWalletsQuery) (page.Result[WalletInfo, uint32], error) {
 
-	rows, err := s.queries.ListWallets(ctx)
+	items, err := page.FetchFirstOrNext(
+		ctx,
+		s.queries.ListWalletsFirstPage,
+		func(limit uint32) int64 { return int64(limit) },
+		s.queries.ListWalletsNextPage,
+		pgWalletNextPageParams,
+		query.Page,
+		"wallets",
+		pgWalletRowToInfo[sqlcpg.ListWalletsFirstPageRow],
+		pgWalletRowToInfo[sqlcpg.ListWalletsNextPageRow],
+	)
 	if err != nil {
-		return nil, fmt.Errorf("list wallets: %w", err)
+		err = fmt.Errorf("list wallets page: %w", err)
+		return page.Result[WalletInfo, uint32]{}, err
 	}
 
-	wallets := make([]WalletInfo, len(rows))
-	for i, row := range rows {
-		info, err := buildPgWalletInfo(pgWalletRowParams{
-			id:                     row.ID,
-			name:                   row.WalletName,
-			isImported:             row.IsImported,
-			managerVersion:         row.ManagerVersion,
-			isWatchOnly:            row.IsWatchOnly,
-			syncedHeight:           row.SyncedHeight,
-			syncedBlockHash:        row.SyncedBlockHash,
-			syncedBlockTimestamp:   row.SyncedBlockTimestamp,
-			birthdayHeight:         row.BirthdayHeight,
-			birthdayTimestamp:      row.BirthdayTimestamp,
-			birthdayBlockHash:      row.BirthdayBlockHash,
-			birthdayBlockTimestamp: row.BirthdayBlockTimestamp,
-		})
-		if err != nil {
-			return nil, err
-		}
+	result := page.BuildResult(
+		query.Page, items,
+		func(item WalletInfo) uint32 {
+			return item.ID
+		},
+	)
 
-		wallets[i] = *info
-	}
+	return result, nil
+}
 
-	return wallets, nil
+// IterWallets returns an iterator over paginated wallet results.
+func (s *PostgresStore) IterWallets(ctx context.Context,
+	query ListWalletsQuery) iter.Seq2[WalletInfo, error] {
+
+	return page.Iter(ctx, query, "wallets", s.ListWallets,
+		nextListWalletsQuery)
 }
 
 // UpdateWallet updates various properties of a wallet, such as its
@@ -289,6 +292,41 @@ type pgWalletRowParams struct {
 	birthdayTimestamp      sql.NullTime
 	birthdayBlockHash      []byte
 	birthdayBlockTimestamp sql.NullInt64
+}
+
+type pgWalletInfoRow interface {
+	sqlcpg.GetWalletByNameRow |
+		sqlcpg.GetWalletByIDRow |
+		sqlcpg.ListWalletsFirstPageRow |
+		sqlcpg.ListWalletsNextPageRow
+}
+
+func pgWalletRowToInfo[T pgWalletInfoRow](row T) (*WalletInfo, error) {
+	base := sqlcpg.GetWalletByNameRow(row)
+
+	return buildPgWalletInfo(pgWalletRowParams{
+		id:                     base.ID,
+		name:                   base.WalletName,
+		isImported:             base.IsImported,
+		managerVersion:         base.ManagerVersion,
+		isWatchOnly:            base.IsWatchOnly,
+		syncedHeight:           base.SyncedHeight,
+		syncedBlockHash:        base.SyncedBlockHash,
+		syncedBlockTimestamp:   base.SyncedBlockTimestamp,
+		birthdayHeight:         base.BirthdayHeight,
+		birthdayTimestamp:      base.BirthdayTimestamp,
+		birthdayBlockHash:      base.BirthdayBlockHash,
+		birthdayBlockTimestamp: base.BirthdayBlockTimestamp,
+	})
+}
+
+func pgWalletNextPageParams(cursorID uint32,
+	pageLimit uint32) sqlcpg.ListWalletsNextPageParams {
+
+	return sqlcpg.ListWalletsNextPageParams{
+		CursorID:  int64(cursorID),
+		PageLimit: int64(pageLimit),
+	}
 }
 
 // buildPgWalletInfo constructs a WalletInfo from the given wallet row

@@ -61,7 +61,9 @@ LEFT JOIN blocks AS b_synced ON s.synced_height = b_synced.block_height
 LEFT JOIN blocks AS b_birthday ON s.birthday_height = b_birthday.block_height
 WHERE w.wallet_name = ?;
 
--- name: ListWallets :many
+-- name: ListWalletsFirstPage :many
+-- Lists the first page of wallets ordered by wallet ID.
+-- Returns up to page_limit rows.
 SELECT
     w.id,
     w.wallet_name,
@@ -80,7 +82,34 @@ FROM wallets AS w
 LEFT JOIN wallet_sync_states AS s ON w.id = s.wallet_id
 LEFT JOIN blocks AS b_synced ON s.synced_height = b_synced.block_height
 LEFT JOIN blocks AS b_birthday ON s.birthday_height = b_birthday.block_height
-ORDER BY w.id;
+ORDER BY w.id
+LIMIT sqlc.arg(page_limit);
+
+-- name: ListWalletsNextPage :many
+-- Lists the next page of wallets ordered by wallet ID, starting
+-- strictly after cursor_id.
+-- Returns up to page_limit rows.
+SELECT
+    w.id,
+    w.wallet_name,
+    w.is_imported,
+    w.manager_version,
+    w.is_watch_only,
+    s.synced_height,
+    s.birthday_height,
+    s.birthday_timestamp,
+    s.updated_at,
+    b_synced.header_hash AS synced_block_hash,
+    b_synced.block_timestamp AS synced_block_timestamp,
+    b_birthday.header_hash AS birthday_block_hash,
+    b_birthday.block_timestamp AS birthday_block_timestamp
+FROM wallets AS w
+LEFT JOIN wallet_sync_states AS s ON w.id = s.wallet_id
+LEFT JOIN blocks AS b_synced ON s.synced_height = b_synced.block_height
+LEFT JOIN blocks AS b_birthday ON s.birthday_height = b_birthday.block_height
+WHERE w.id > sqlc.arg('cursor_id')
+ORDER BY w.id
+LIMIT sqlc.arg(page_limit);
 
 -- name: GetWalletByID :one
 SELECT
