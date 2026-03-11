@@ -70,10 +70,10 @@ INSERT INTO addresses (
 )
 RETURNING id, created_at;
 
--- name: ListAddressesByAccount :many
--- Lists all addresses for a given account identified by wallet_id, key scope
--- (purpose/coin_type), and account name. Returns all address columns for
--- filtering and processing by the application.
+-- name: ListAddressesByAccountFirstPage :many
+-- Lists the first page of addresses for an account identified by wallet_id,
+-- key scope (purpose/coin_type), and account name, ordered by address ID.
+-- Returns up to page_limit rows.
 SELECT
     a.id,
     a.account_id,
@@ -93,4 +93,36 @@ LEFT JOIN address_secrets AS s ON a.id = s.address_id
 WHERE
     ks.wallet_id = ? AND ks.purpose = ? AND ks.coin_type = ?
     AND acc.account_name = ?
-ORDER BY a.id;
+ORDER BY a.id
+LIMIT sqlc.arg(page_limit);
+
+-- name: ListAddressesByAccountNextPage :many
+-- Lists the next page of addresses for the same account filters, ordered by
+-- address ID, starting strictly after cursor_id.
+-- Returns up to page_limit rows.
+SELECT
+    a.id,
+    a.account_id,
+    a.type_id,
+    a.address_branch,
+    a.address_index,
+    a.script_pub_key,
+    a.pub_key,
+    a.created_at,
+    acc.origin_id,
+    s.encrypted_priv_key IS NOT NULL AS has_private_key,
+    s.encrypted_script IS NOT NULL AS has_script
+FROM addresses AS a
+INNER JOIN accounts AS acc ON a.account_id = acc.id
+INNER JOIN key_scopes AS ks ON acc.scope_id = ks.id
+LEFT JOIN address_secrets AS s ON a.id = s.address_id
+WHERE
+    ks.wallet_id = ? AND ks.purpose = ? AND ks.coin_type = ?
+    AND acc.account_name = ?
+    -- sqlc.arg() calls are bind parameters, not column references; the
+    -- RF02 suppression below silences a false-positive from sqlfluff,
+    -- which cannot distinguish sqlc pseudo-functions from column names
+    -- in a multi-table JOIN context.
+    AND a.id > sqlc.arg(cursor_id) -- noqa: RF02
+ORDER BY a.id
+LIMIT sqlc.arg(page_limit);

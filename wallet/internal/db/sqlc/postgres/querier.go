@@ -325,10 +325,14 @@ type Querier interface {
 	ListActiveUtxoLeases(ctx context.Context, arg ListActiveUtxoLeasesParams) ([]ListActiveUtxoLeasesRow, error)
 	// Returns all address types ordered by ID.
 	ListAddressTypes(ctx context.Context) ([]AddressType, error)
-	// Lists all addresses for a given account identified by wallet_id, key scope
-	// (purpose/coin_type), and account name. Returns all address columns for
-	// filtering and processing by the application.
-	ListAddressesByAccount(ctx context.Context, arg ListAddressesByAccountParams) ([]ListAddressesByAccountRow, error)
+	// Lists the first page of addresses for an account identified by wallet_id,
+	// key scope (purpose/coin_type), and account name, ordered by address ID.
+	// Returns up to page_limit rows.
+	ListAddressesByAccountFirstPage(ctx context.Context, arg ListAddressesByAccountFirstPageParams) ([]ListAddressesByAccountFirstPageRow, error)
+	// Lists the next page of addresses for the same account filters, ordered by
+	// address ID, starting strictly after cursor_id.
+	// Returns up to page_limit rows.
+	ListAddressesByAccountNextPage(ctx context.Context, arg ListAddressesByAccountNextPageParams) ([]ListAddressesByAccountNextPageRow, error)
 	// Lists all key scopes for a wallet, ordered by ID.
 	ListKeyScopesByWallet(ctx context.Context, walletID int64) ([]KeyScope, error)
 	// Lists victim txids for a given replacement txid.

@@ -76,6 +76,9 @@ ON addresses (account_id, script_pub_key);
 -- Used by GetAddressByScriptPubKey.
 CREATE INDEX idx_addresses_script_pub_key ON addresses (script_pub_key);
 
+CREATE INDEX idx_addresses_by_account_pagination
+ON addresses (account_id, id);
+
 -- Address Secrets table stores sensitive encrypted material needed to spend
 -- from an address. This table has a one-to-one relationship with addresses.
 -- Watch-only addresses may have no row in this table.

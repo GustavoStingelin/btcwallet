@@ -202,7 +202,7 @@ func (q *Queries) InsertAddressSecret(ctx context.Context, arg InsertAddressSecr
 	return err
 }
 
-const ListAddressesByAccount = `-- name: ListAddressesByAccount :many
+const ListAddressesByAccountFirstPage = `-- name: ListAddressesByAccountFirstPage :many
 SELECT
     a.id,
     a.account_id,
@@ -223,16 +223,18 @@ WHERE
     ks.wallet_id = $1 AND ks.purpose = $2 AND ks.coin_type = $3
     AND acc.account_name = $4
 ORDER BY a.id
+LIMIT $5::BIGINT
 `
 
-type ListAddressesByAccountParams struct {
+type ListAddressesByAccountFirstPageParams struct {
 	WalletID    int64
 	Purpose     int64
 	CoinType    int64
 	AccountName string
+	PageLimit   int64
 }
 
-type ListAddressesByAccountRow struct {
+type ListAddressesByAccountFirstPageRow struct {
 	ID            int64
 	AccountID     int64
 	TypeID        int16
@@ -246,23 +248,121 @@ type ListAddressesByAccountRow struct {
 	HasScript     bool
 }
 
-// Lists all addresses for a given account identified by wallet_id, key scope
-// (purpose/coin_type), and account name. Returns all address columns for
-// filtering and processing by the application.
-func (q *Queries) ListAddressesByAccount(ctx context.Context, arg ListAddressesByAccountParams) ([]ListAddressesByAccountRow, error) {
-	rows, err := q.query(ctx, q.listAddressesByAccountStmt, ListAddressesByAccount,
+// Lists the first page of addresses for an account identified by wallet_id,
+// key scope (purpose/coin_type), and account name, ordered by address ID.
+// Returns up to page_limit rows.
+func (q *Queries) ListAddressesByAccountFirstPage(ctx context.Context, arg ListAddressesByAccountFirstPageParams) ([]ListAddressesByAccountFirstPageRow, error) {
+	rows, err := q.query(ctx, q.listAddressesByAccountFirstPageStmt, ListAddressesByAccountFirstPage,
 		arg.WalletID,
 		arg.Purpose,
 		arg.CoinType,
 		arg.AccountName,
+		arg.PageLimit,
 	)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []ListAddressesByAccountRow
+	var items []ListAddressesByAccountFirstPageRow
 	for rows.Next() {
-		var i ListAddressesByAccountRow
+		var i ListAddressesByAccountFirstPageRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.AccountID,
+			&i.TypeID,
+			&i.AddressBranch,
+			&i.AddressIndex,
+			&i.ScriptPubKey,
+			&i.PubKey,
+			&i.CreatedAt,
+			&i.OriginID,
+			&i.HasPrivateKey,
+			&i.HasScript,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const ListAddressesByAccountNextPage = `-- name: ListAddressesByAccountNextPage :many
+SELECT
+    a.id,
+    a.account_id,
+    a.type_id,
+    a.address_branch,
+    a.address_index,
+    a.script_pub_key,
+    a.pub_key,
+    a.created_at,
+    acc.origin_id,
+    (s.encrypted_priv_key IS NOT NULL)::BOOLEAN AS has_private_key,
+    (s.encrypted_script IS NOT NULL)::BOOLEAN AS has_script
+FROM addresses AS a
+INNER JOIN accounts AS acc ON a.account_id = acc.id
+INNER JOIN key_scopes AS ks ON acc.scope_id = ks.id
+LEFT JOIN address_secrets AS s ON a.id = s.address_id
+WHERE
+    ks.wallet_id = $1 AND ks.purpose = $2 AND ks.coin_type = $3
+    AND acc.account_name = $4
+    -- sqlc.arg() calls are bind parameters, not column references; the
+    -- RF02 suppression below silences a false-positive from sqlfluff,
+    -- which cannot distinguish sqlc pseudo-functions from column names
+    -- in a multi-table JOIN context.
+    AND a.id > $5 -- noqa: RF02
+ORDER BY a.id
+LIMIT $6::BIGINT
+`
+
+type ListAddressesByAccountNextPageParams struct {
+	WalletID    int64
+	Purpose     int64
+	CoinType    int64
+	AccountName string
+	CursorID    int64
+	PageLimit   int64
+}
+
+type ListAddressesByAccountNextPageRow struct {
+	ID            int64
+	AccountID     int64
+	TypeID        int16
+	AddressBranch sql.NullInt16
+	AddressIndex  sql.NullInt64
+	ScriptPubKey  []byte
+	PubKey        []byte
+	CreatedAt     time.Time
+	OriginID      int16
+	HasPrivateKey bool
+	HasScript     bool
+}
+
+// Lists the next page of addresses for the same account filters, ordered by
+// address ID, starting strictly after cursor_id.
+// Returns up to page_limit rows.
+func (q *Queries) ListAddressesByAccountNextPage(ctx context.Context, arg ListAddressesByAccountNextPageParams) ([]ListAddressesByAccountNextPageRow, error) {
+	rows, err := q.query(ctx, q.listAddressesByAccountNextPageStmt, ListAddressesByAccountNextPage,
+		arg.WalletID,
+		arg.Purpose,
+		arg.CoinType,
+		arg.AccountName,
+		arg.CursorID,
+		arg.PageLimit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListAddressesByAccountNextPageRow
+	for rows.Next() {
+		var i ListAddressesByAccountNextPageRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.AccountID,

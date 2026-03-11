@@ -195,8 +195,11 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.listAddressTypesStmt, err = db.PrepareContext(ctx, ListAddressTypes); err != nil {
 		return nil, fmt.Errorf("error preparing query ListAddressTypes: %w", err)
 	}
-	if q.listAddressesByAccountStmt, err = db.PrepareContext(ctx, ListAddressesByAccount); err != nil {
-		return nil, fmt.Errorf("error preparing query ListAddressesByAccount: %w", err)
+	if q.listAddressesByAccountFirstPageStmt, err = db.PrepareContext(ctx, ListAddressesByAccountFirstPage); err != nil {
+		return nil, fmt.Errorf("error preparing query ListAddressesByAccountFirstPage: %w", err)
+	}
+	if q.listAddressesByAccountNextPageStmt, err = db.PrepareContext(ctx, ListAddressesByAccountNextPage); err != nil {
+		return nil, fmt.Errorf("error preparing query ListAddressesByAccountNextPage: %w", err)
 	}
 	if q.listKeyScopesByWalletStmt, err = db.PrepareContext(ctx, ListKeyScopesByWallet); err != nil {
 		return nil, fmt.Errorf("error preparing query ListKeyScopesByWallet: %w", err)
@@ -548,9 +551,14 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing listAddressTypesStmt: %w", cerr)
 		}
 	}
-	if q.listAddressesByAccountStmt != nil {
-		if cerr := q.listAddressesByAccountStmt.Close(); cerr != nil {
-			err = fmt.Errorf("error closing listAddressesByAccountStmt: %w", cerr)
+	if q.listAddressesByAccountFirstPageStmt != nil {
+		if cerr := q.listAddressesByAccountFirstPageStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing listAddressesByAccountFirstPageStmt: %w", cerr)
+		}
+	}
+	if q.listAddressesByAccountNextPageStmt != nil {
+		if cerr := q.listAddressesByAccountNextPageStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing listAddressesByAccountNextPageStmt: %w", cerr)
 		}
 	}
 	if q.listKeyScopesByWalletStmt != nil {
@@ -749,7 +757,8 @@ type Queries struct {
 	listAccountsByWalletScopeStmt               *sql.Stmt
 	listActiveUtxoLeasesStmt                    *sql.Stmt
 	listAddressTypesStmt                        *sql.Stmt
-	listAddressesByAccountStmt                  *sql.Stmt
+	listAddressesByAccountFirstPageStmt         *sql.Stmt
+	listAddressesByAccountNextPageStmt          *sql.Stmt
 	listKeyScopesByWalletStmt                   *sql.Stmt
 	listReplacedTxHashesByReplacementTxHashStmt *sql.Stmt
 	listReplacedTxIDsByReplacementTxIDStmt      *sql.Stmt
@@ -833,7 +842,8 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		listAccountsByWalletScopeStmt:               q.listAccountsByWalletScopeStmt,
 		listActiveUtxoLeasesStmt:                    q.listActiveUtxoLeasesStmt,
 		listAddressTypesStmt:                        q.listAddressTypesStmt,
-		listAddressesByAccountStmt:                  q.listAddressesByAccountStmt,
+		listAddressesByAccountFirstPageStmt:         q.listAddressesByAccountFirstPageStmt,
+		listAddressesByAccountNextPageStmt:          q.listAddressesByAccountNextPageStmt,
 		listKeyScopesByWalletStmt:                   q.listKeyScopesByWalletStmt,
 		listReplacedTxHashesByReplacementTxHashStmt: q.listReplacedTxHashesByReplacementTxHashStmt,
 		listReplacedTxIDsByReplacementTxIDStmt:      q.listReplacedTxIDsByReplacementTxIDStmt,

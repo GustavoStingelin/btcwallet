@@ -3,8 +3,11 @@ package db
 import (
 	"context"
 	"database/sql"
+	"fmt"
+	"iter"
 	"time"
 
+	"github.com/btcsuite/btcwallet/wallet/internal/db/page"
 	sqlcsqlite "github.com/btcsuite/btcwallet/wallet/internal/db/sqlc/sqlite"
 )
 
@@ -30,20 +33,33 @@ func (s *SqliteStore) GetAddress(ctx context.Context,
 	return getAddressByQuery(ctx, query, getByScript)
 }
 
-// ListAddresses returns a slice of AddressInfo for all addresses in a given
-// account.
+// ListAddresses returns a page of addresses matching the given query.
 func (s *SqliteStore) ListAddresses(ctx context.Context,
-	query ListAddressesQuery) ([]AddressInfo, error) {
+	query ListAddressesQuery) (page.Result[AddressInfo, uint32], error) {
 
-	return listAddresses(
-		ctx, s.queries.ListAddressesByAccount,
-		sqlcsqlite.ListAddressesByAccountParams{
-			WalletID:    int64(query.WalletID),
-			Purpose:     int64(query.Scope.Purpose),
-			CoinType:    int64(query.Scope.Coin),
-			AccountName: query.AccountName,
-		}, sqliteAddressRowToInfo,
+	listQueries := sqliteAddressListPagedQueries{q: s.queries}
+
+	items, err := listQueries.byAccount(ctx, query)
+	if err != nil {
+		return page.Result[AddressInfo, uint32]{}, err
+	}
+
+	result := page.BuildResult(
+		query.Page, items,
+		func(item AddressInfo) uint32 {
+			return item.ID
+		},
 	)
+
+	return result, nil
+}
+
+// IterAddresses returns an iterator over paginated address results.
+func (s *SqliteStore) IterAddresses(ctx context.Context,
+	query ListAddressesQuery) iter.Seq2[AddressInfo, error] {
+
+	return page.Iter(ctx, query, "addresses", s.ListAddresses,
+		nextListAddressesQuery)
 }
 
 // GetAddressSecret retrieves the encrypted secret information for an address.
@@ -261,7 +277,8 @@ func sqliteAddressSecretRowToSecret(
 // single generic conversion function to handle all address query result types.
 type sqliteAddressInfoRow interface {
 	sqlcsqlite.GetAddressByScriptPubKeyRow |
-		sqlcsqlite.ListAddressesByAccountRow
+		sqlcsqlite.ListAddressesByAccountFirstPageRow |
+		sqlcsqlite.ListAddressesByAccountNextPageRow
 }
 
 // sqliteAddressRowToInfo converts a SQLite address row to an AddressInfo
@@ -292,4 +309,66 @@ func sqliteAddressRowToInfo[T sqliteAddressInfoRow](row T) (*AddressInfo,
 	}
 
 	return info, nil
+}
+
+// sqliteAddressListPagedQueries holds the queries for paginated address
+// listing in SQLite.
+type sqliteAddressListPagedQueries struct {
+	q *sqlcsqlite.Queries
+}
+
+// byAccount lists addresses filtered by wallet ID, key scope, and account
+// name, with pagination support.
+func (s sqliteAddressListPagedQueries) byAccount(ctx context.Context,
+	query ListAddressesQuery) ([]AddressInfo, error) {
+
+	items, err := page.FetchFirstOrNext(
+		ctx,
+		s.q.ListAddressesByAccountFirstPage,
+		sqliteBuildAddressFirstPageParams(query),
+		s.q.ListAddressesByAccountNextPage,
+		sqliteBuildAddressNextPageParams(query),
+		query.Page,
+		"addresses",
+		sqliteAddressRowToInfo[sqlcsqlite.ListAddressesByAccountFirstPageRow],
+		sqliteAddressRowToInfo[sqlcsqlite.ListAddressesByAccountNextPageRow],
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list addresses by account: %w", err)
+	}
+
+	return items, nil
+}
+
+func sqliteBuildAddressFirstPageParams(q ListAddressesQuery) func(
+	uint32) sqlcsqlite.ListAddressesByAccountFirstPageParams {
+
+	return func(
+		pageLimit uint32) sqlcsqlite.ListAddressesByAccountFirstPageParams {
+
+		return sqlcsqlite.ListAddressesByAccountFirstPageParams{
+			WalletID:    int64(q.WalletID),
+			Purpose:     int64(q.Scope.Purpose),
+			CoinType:    int64(q.Scope.Coin),
+			AccountName: q.AccountName,
+			PageLimit:   int64(pageLimit),
+		}
+	}
+}
+
+func sqliteBuildAddressNextPageParams(q ListAddressesQuery) func(
+	uint32, uint32) sqlcsqlite.ListAddressesByAccountNextPageParams {
+
+	return func(cursorID uint32,
+		pageLimit uint32) sqlcsqlite.ListAddressesByAccountNextPageParams {
+
+		return sqlcsqlite.ListAddressesByAccountNextPageParams{
+			WalletID:    int64(q.WalletID),
+			Purpose:     int64(q.Scope.Purpose),
+			CoinType:    int64(q.Scope.Coin),
+			AccountName: q.AccountName,
+			CursorID:    int64(cursorID),
+			PageLimit:   int64(pageLimit),
+		}
+	}
 }
