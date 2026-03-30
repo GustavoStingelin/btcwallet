@@ -12,7 +12,7 @@ import (
 
 // NewTestStore creates a new SQLite database for testing with migrations
 // applied. Each test gets its own temporary database file.
-func NewTestStore(t *testing.T) *db.SqliteStore {
+func NewTestStore(t testing.TB) *db.SqliteStore {
 	t.Helper()
 
 	tmpDir := t.TempDir()

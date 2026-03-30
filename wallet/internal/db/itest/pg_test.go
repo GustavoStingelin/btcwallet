@@ -154,7 +154,7 @@ func GetPostgresContainer(ctx context.Context) (*postgres.PostgresContainer,
 
 // sanitizedPgDBName converts a test name to a valid PostgreSQL database name.
 // It converts to lowercase and replaces special characters with underscores.
-func sanitizedPgDBName(t *testing.T) string {
+func sanitizedPgDBName(t testing.TB) string {
 	// Convert to lowercase.
 	dbName := strings.ToLower(t.Name())
 
@@ -181,7 +181,7 @@ func sanitizedPgDBName(t *testing.T) string {
 // limit allows, exhausting the PostgreSQL connection pool. Avoid this by
 // creating NewTestStore inside each parallel subtest so its lifecycle is tied
 // to the subtest's parallel slot.
-func NewTestStore(t *testing.T) *db.PostgresStore {
+func NewTestStore(t testing.TB) *db.PostgresStore {
 	t.Helper()
 	ctx := t.Context()
 
