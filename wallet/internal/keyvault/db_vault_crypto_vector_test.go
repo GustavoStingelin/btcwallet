@@ -168,16 +168,6 @@ func TestDBVaultKnownVectorUnlockAndDecrypt(t *testing.T) {
 			)
 			t.Cleanup(vault.Lock)
 
-			require.NotNil(t, vault.unlockedState)
-			require.Equal(
-				t, decodeHex(t, known.expectedCryptoPrivKeyHex),
-				vault.unlockedState.cryptoKeyPrivate[:],
-			)
-			require.Equal(
-				t, decodeHex(t, known.expectedCryptoScriptKeyHex),
-				vault.unlockedState.cryptoKeyScript[:],
-			)
-
 			decryptedPrivate, err := vault.Decrypt(
 				waddrmgr.CKTPrivate,
 				decodeHex(t, known.privateCiphertextHex),

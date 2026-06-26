@@ -1,6 +1,7 @@
 package keyvault
 
 import (
+	"context"
 	"errors"
 	"fmt"
 
@@ -16,37 +17,55 @@ var errUnsupportedCryptoKeyType = errors.New("unsupported crypto key type")
 func (v *DBVault) Encrypt(keyType waddrmgr.CryptoKeyType,
 	plaintext []byte) ([]byte, error) {
 
-	v.mtx.Lock()
-	defer v.mtx.Unlock()
-
-	if v.unlockedState == nil {
-		return nil, fmt.Errorf("wallet %d vault Encrypt: %w", v.walletID,
-			ErrVaultLocked)
+	req := vaultEncryptReq{
+		keyType:   keyType,
+		plaintext: plaintext,
+		resp:      make(vaultBytesResp, 1),
 	}
 
-	cryptoKey, err := v.selectUnlockedCryptoKey(keyType)
+	v.requests <- req
+
+	return waitForBytes(context.Background(), req.resp)
+}
+
+// handleEncryptReq encrypts plaintext with the selected runtime key.
+func (v *DBVault) handleEncryptReq(state *unlockedState,
+	req vaultEncryptReq) vaultBytesResult {
+
+	if state == nil {
+		return vaultBytesResult{
+			err: fmt.Errorf("wallet %d vault Encrypt: %w", v.walletID,
+				ErrVaultLocked),
+		}
+	}
+
+	cryptoKey, err := selectUnlockedCryptoKey(state, req.keyType)
 	if err != nil {
-		return nil, fmt.Errorf("wallet %d vault Encrypt: %w", v.walletID, err)
+		return vaultBytesResult{
+			err: fmt.Errorf("wallet %d vault Encrypt: %w", v.walletID, err),
+		}
 	}
 
-	ciphertext, err := cryptoKey.Encrypt(plaintext)
+	ciphertext, err := cryptoKey.Encrypt(req.plaintext)
 	if err != nil {
-		return nil, fmt.Errorf("wallet %d vault Encrypt: encrypt: %w",
-			v.walletID, err)
+		return vaultBytesResult{
+			err: fmt.Errorf("wallet %d vault Encrypt: encrypt: %w",
+				v.walletID, err),
+		}
 	}
 
-	return ciphertext, nil
+	return vaultBytesResult{value: ciphertext}
 }
 
 // selectUnlockedCryptoKey returns a crypto key available in unlockedState.
-func (v *DBVault) selectUnlockedCryptoKey(
+func selectUnlockedCryptoKey(state *unlockedState,
 	keyType waddrmgr.CryptoKeyType) (*snacl.CryptoKey, error) {
 
 	switch keyType {
 	case waddrmgr.CKTPrivate:
-		return &v.unlockedState.cryptoKeyPrivate, nil
+		return &state.cryptoKeyPrivate, nil
 	case waddrmgr.CKTScript:
-		return &v.unlockedState.cryptoKeyScript, nil
+		return &state.cryptoKeyScript, nil
 	case waddrmgr.CKTPublic:
 		return nil, fmt.Errorf("public crypto key: %w",
 			errUnsupportedCryptoKeyType)

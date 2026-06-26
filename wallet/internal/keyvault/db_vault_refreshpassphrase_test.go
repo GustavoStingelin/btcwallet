@@ -22,7 +22,6 @@ func TestDBVaultRefreshPrivatePassphraseLockedRequiresUnlockedState(
 	require.Error(t, err)
 	require.ErrorIs(t, err, ErrVaultLocked)
 	require.True(t, vault.IsLocked())
-	require.Nil(t, vault.unlockedState)
 }
 
 // TestDBVaultRefreshPrivatePassphraseUpdateErrorPreservesState verifies that
@@ -60,23 +59,13 @@ func TestDBVaultRefreshPrivatePassphraseUpdateErrorPreservesState(
 	require.NoError(t, vault.Unlock(t.Context(), correctPassphrase, -1))
 	t.Cleanup(vault.Lock)
 
-	oldState := vault.unlockedState
 	err := vault.RefreshPrivatePassphrase(t.Context(), newPassphrase)
 	require.Error(t, err)
 	require.ErrorIs(t, err, errStoreUnavailable)
 
 	require.Equal(t, walletID, capturedUpdate.WalletID)
-	require.Same(t, oldState, vault.unlockedState)
-	require.Equal(
-		t, oldExpected.cryptoKeyPrivate[:], oldState.cryptoKeyPrivate[:],
-	)
-	require.Equal(
-		t, oldExpected.cryptoKeyScript[:], oldState.cryptoKeyScript[:],
-	)
-	require.Equal(
-		t, oldExpected.hdRootKey.String(), oldState.hdRootKey.String(),
-	)
 	require.False(t, vault.IsLocked())
+	assertVaultHasRuntimeState(t, vault, oldExpected)
 }
 
 // TestDBVaultRefreshPrivatePassphraseSuccessPersistsRotation verifies that a
@@ -115,30 +104,11 @@ func TestDBVaultRefreshPrivatePassphraseSuccessPersistsRotation(
 	require.NoError(t, vault.Unlock(t.Context(), correctPassphrase, time.Hour))
 	t.Cleanup(vault.Lock)
 
-	oldState := vault.unlockedState
-	oldTimer := vault.timer.timer
-	oldGeneration := vault.timer.generation
-
-	require.NotNil(t, oldTimer)
 	require.NoError(
 		t, vault.RefreshPrivatePassphrase(t.Context(), newPassphrase),
 	)
-	require.Same(t, oldState, vault.unlockedState)
-	require.Same(t, oldTimer, vault.timer.timer)
-	require.Equal(t, oldGeneration, vault.timer.generation)
-	require.Equal(
-		t, oldExpected.cryptoKeyPrivate[:],
-		vault.unlockedState.cryptoKeyPrivate[:],
-	)
-	require.Equal(
-		t, oldExpected.cryptoKeyScript[:],
-		vault.unlockedState.cryptoKeyScript[:],
-	)
-	require.Equal(
-		t, oldExpected.hdRootKey.String(),
-		vault.unlockedState.hdRootKey.String(),
-	)
 	require.False(t, vault.IsLocked())
+	assertVaultHasRuntimeState(t, vault, oldExpected)
 
 	updatedSecrets := &db.WalletSecrets{
 		MasterPrivParams:         capturedUpdate.MasterPrivParams,

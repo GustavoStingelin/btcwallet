@@ -13,17 +13,7 @@ import (
 func TestDBVaultDecryptSelectedRuntimeKeys(t *testing.T) {
 	t.Parallel()
 
-	privateKey, err := snacl.GenerateCryptoKey()
-	require.NoError(t, err)
-	scriptKey, err := snacl.GenerateCryptoKey()
-	require.NoError(t, err)
-
-	vault := NewDBVault(nil, 1)
-	vault.unlockedState = &unlockedState{
-		cryptoKeyPrivate: *privateKey,
-		cryptoKeyScript:  *scriptKey,
-	}
-	t.Cleanup(vault.Lock)
+	vault, expected := unlockTestVault(t, 22, -1)
 
 	tests := []struct {
 		name    string
@@ -33,12 +23,12 @@ func TestDBVaultDecryptSelectedRuntimeKeys(t *testing.T) {
 		{
 			name:    "private key",
 			keyType: waddrmgr.CKTPrivate,
-			key:     privateKey,
+			key:     &expected.cryptoKeyPrivate,
 		},
 		{
 			name:    "script key",
 			keyType: waddrmgr.CKTScript,
-			key:     scriptKey,
+			key:     &expected.cryptoKeyScript,
 		},
 	}
 
@@ -76,10 +66,7 @@ func TestDBVaultDecryptLocked(t *testing.T) {
 func TestDBVaultDecryptUnsupportedKeyTypes(t *testing.T) {
 	t.Parallel()
 
-	state := makeUnlockedState(t)
-	vault := NewDBVault(nil, 1)
-	vault.unlockedState = state
-	t.Cleanup(vault.Lock)
+	vault, _ := unlockTestVault(t, 23, -1)
 
 	tests := []struct {
 		name    string
@@ -106,7 +93,7 @@ func TestDBVaultDecryptUnsupportedKeyTypes(t *testing.T) {
 			require.Nil(t, plaintext)
 			require.Error(t, err)
 			require.ErrorIs(t, err, errUnsupportedCryptoKeyType)
-			require.ErrorContains(t, err, "wallet 1 vault Decrypt")
+			require.ErrorContains(t, err, "wallet 23 vault Decrypt")
 			require.ErrorContains(t, err, test.message)
 		})
 	}
@@ -117,14 +104,11 @@ func TestDBVaultDecryptUnsupportedKeyTypes(t *testing.T) {
 func TestDBVaultDecryptMalformedCiphertext(t *testing.T) {
 	t.Parallel()
 
-	state := makeUnlockedState(t)
-	vault := NewDBVault(nil, 1)
-	vault.unlockedState = state
-	t.Cleanup(vault.Lock)
+	vault, _ := unlockTestVault(t, 24, -1)
 
 	plaintext, err := vault.Decrypt(waddrmgr.CKTPrivate, []byte("short"))
 	require.Nil(t, plaintext)
 	require.Error(t, err)
 	require.ErrorIs(t, err, snacl.ErrMalformed)
-	require.ErrorContains(t, err, "wallet 1 vault Decrypt: decrypt")
+	require.ErrorContains(t, err, "wallet 24 vault Decrypt: decrypt")
 }

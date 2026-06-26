@@ -19,7 +19,6 @@ func TestDBVaultIsLockedInitialState(t *testing.T) {
 func TestDBVaultIsLockedUnlockedState(t *testing.T) {
 	t.Parallel()
 
-	vault := NewDBVault(nil, 1)
-	vault.unlockedState = &unlockedState{}
+	vault, _ := unlockTestVault(t, 25, -1)
 	require.False(t, vault.IsLocked())
 }

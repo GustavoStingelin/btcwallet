@@ -13,17 +13,7 @@ import (
 func TestDBVaultEncryptSelectedRuntimeKeys(t *testing.T) {
 	t.Parallel()
 
-	privateKey, err := snacl.GenerateCryptoKey()
-	require.NoError(t, err)
-	scriptKey, err := snacl.GenerateCryptoKey()
-	require.NoError(t, err)
-
-	vault := NewDBVault(nil, 1)
-	vault.unlockedState = &unlockedState{
-		cryptoKeyPrivate: *privateKey,
-		cryptoKeyScript:  *scriptKey,
-	}
-	t.Cleanup(vault.Lock)
+	vault, expected := unlockTestVault(t, 20, -1)
 
 	tests := []struct {
 		name    string
@@ -33,12 +23,12 @@ func TestDBVaultEncryptSelectedRuntimeKeys(t *testing.T) {
 		{
 			name:    "private key",
 			keyType: waddrmgr.CKTPrivate,
-			key:     privateKey,
+			key:     &expected.cryptoKeyPrivate,
 		},
 		{
 			name:    "script key",
 			keyType: waddrmgr.CKTScript,
-			key:     scriptKey,
+			key:     &expected.cryptoKeyScript,
 		},
 	}
 
@@ -78,10 +68,8 @@ func TestDBVaultEncryptLocked(t *testing.T) {
 func TestDBVaultEncryptUnsupportedKeyTypes(t *testing.T) {
 	t.Parallel()
 
-	state := makeUnlockedState(t)
-	vault := NewDBVault(nil, 1)
-	vault.unlockedState = state
-	t.Cleanup(vault.Lock)
+	const walletID = uint32(21)
+	vault, _ := unlockTestVault(t, walletID, -1)
 
 	tests := []struct {
 		name    string
@@ -108,7 +96,7 @@ func TestDBVaultEncryptUnsupportedKeyTypes(t *testing.T) {
 			require.Nil(t, ciphertext)
 			require.Error(t, err)
 			require.ErrorIs(t, err, errUnsupportedCryptoKeyType)
-			require.ErrorContains(t, err, "wallet 1 vault Encrypt")
+			require.ErrorContains(t, err, "wallet 21 vault Encrypt")
 			require.ErrorContains(t, err, test.message)
 		})
 	}

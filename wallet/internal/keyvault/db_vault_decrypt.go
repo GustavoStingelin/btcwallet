@@ -1,6 +1,7 @@
 package keyvault
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/btcsuite/btcwallet/waddrmgr"
@@ -10,24 +11,42 @@ import (
 func (v *DBVault) Decrypt(keyType waddrmgr.CryptoKeyType,
 	ciphertext []byte) ([]byte, error) {
 
-	v.mtx.Lock()
-	defer v.mtx.Unlock()
-
-	if v.unlockedState == nil {
-		return nil, fmt.Errorf("wallet %d vault Decrypt: %w", v.walletID,
-			ErrVaultLocked)
+	req := vaultDecryptReq{
+		keyType:    keyType,
+		ciphertext: ciphertext,
+		resp:       make(vaultBytesResp, 1),
 	}
 
-	cryptoKey, err := v.selectUnlockedCryptoKey(keyType)
+	v.requests <- req
+
+	return waitForBytes(context.Background(), req.resp)
+}
+
+// handleDecryptReq decrypts ciphertext with the selected runtime key.
+func (v *DBVault) handleDecryptReq(state *unlockedState,
+	req vaultDecryptReq) vaultBytesResult {
+
+	if state == nil {
+		return vaultBytesResult{
+			err: fmt.Errorf("wallet %d vault Decrypt: %w", v.walletID,
+				ErrVaultLocked),
+		}
+	}
+
+	cryptoKey, err := selectUnlockedCryptoKey(state, req.keyType)
 	if err != nil {
-		return nil, fmt.Errorf("wallet %d vault Decrypt: %w", v.walletID, err)
+		return vaultBytesResult{
+			err: fmt.Errorf("wallet %d vault Decrypt: %w", v.walletID, err),
+		}
 	}
 
-	plaintext, err := cryptoKey.Decrypt(ciphertext)
+	plaintext, err := cryptoKey.Decrypt(req.ciphertext)
 	if err != nil {
-		return nil, fmt.Errorf("wallet %d vault Decrypt: decrypt: %w",
-			v.walletID, err)
+		return vaultBytesResult{
+			err: fmt.Errorf("wallet %d vault Decrypt: decrypt: %w",
+				v.walletID, err),
+		}
 	}
 
-	return plaintext, nil
+	return vaultBytesResult{value: plaintext}
 }

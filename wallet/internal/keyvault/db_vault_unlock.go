@@ -16,28 +16,50 @@ import (
 func (v *DBVault) Unlock(ctx context.Context, passphrase []byte,
 	timeout time.Duration) error {
 
-	v.mtx.Lock()
-	defer v.mtx.Unlock()
-
-	secrets, err := v.store.GetWalletSecrets(ctx, v.walletID)
-	if err != nil {
-		return fmt.Errorf("wallet %d vault Unlock: get secrets: %w",
-			v.walletID, err)
+	req := vaultUnlockReq{
+		ctx:        ctx,
+		passphrase: passphrase,
+		timeout:    timeout,
+		resp:       make(vaultErrResp, 1),
 	}
 
-	state, err := decryptWalletSecrets(secrets, passphrase)
+	err := v.sendReq(ctx, req)
 	if err != nil {
-		return fmt.Errorf("wallet %d vault Unlock: decrypt secrets: %w",
-			v.walletID, err)
+		return err
 	}
 
-	// after a successful unlockedState construction, we can clear any existing
-	// runtime state, set the new state, and schedule the auto locking.
-	v.clearRuntimeAndLock()
-	v.unlockedState = state
-	v.scheduleLocking(timeout)
+	return waitForErr(ctx, req.resp)
+}
 
-	return nil
+// handleUnlockReq decrypts persisted secrets and installs new runtime state on
+// success.
+func (v *DBVault) handleUnlockReq(state *unlockedState, lockTimer *time.Timer,
+	req vaultUnlockReq) (*unlockedState, *time.Timer, <-chan time.Time) {
+
+	secrets, err := v.store.GetWalletSecrets(req.ctx, v.walletID)
+	if err != nil {
+		req.resp <- fmt.Errorf("wallet %d vault Unlock: get secrets: %w",
+			v.walletID, err)
+
+		return state, lockTimer, timerChan(lockTimer)
+	}
+
+	newState, err := decryptWalletSecrets(secrets, req.passphrase)
+	if err != nil {
+		req.resp <- fmt.Errorf("wallet %d vault Unlock: decrypt secrets: %w",
+			v.walletID, err)
+
+		return state, lockTimer, timerChan(lockTimer)
+	}
+
+	state = clearRuntimeState(state)
+	lockTimer = stopAutoLockTimer(lockTimer)
+	state = newState
+	lockTimer = scheduleAutoLockTimer(req.timeout)
+
+	req.resp <- nil
+
+	return state, lockTimer, timerChan(lockTimer)
 }
 
 // decryptWalletSecrets decrypts persisted wallet secrets into runtime state.

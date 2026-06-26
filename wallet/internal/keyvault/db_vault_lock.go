@@ -1,41 +1,28 @@
 package keyvault
 
-import "time"
+import (
+	"time"
+)
 
 // Lock locks the vault, clears any pending automatic lock, and erases runtime
 // secret material from memory.
 func (v *DBVault) Lock() {
-	v.mtx.Lock()
-	defer v.mtx.Unlock()
+	req := vaultLockReq{
+		resp: make(vaultErrResp, 1),
+	}
 
-	v.clearRuntimeAndLock()
+	v.requests <- req
+	<-req.resp
 }
 
-// clearRuntimeAndLock clears unlocked state and pending timers, locking the
-// vault.
-//
-// This method must be called with v.mtx held.
-func (v *DBVault) clearRuntimeAndLock() {
-	v.timer.cancelScheduled()
+// handleLockReq clears runtime state, stops the auto-lock timer, and reports
+// the vault as locked.
+func (v *DBVault) handleLockReq(state *unlockedState, lockTimer *time.Timer,
+	req vaultLockReq) (*unlockedState, *time.Timer, <-chan time.Time) {
 
-	if v.unlockedState != nil {
-		v.unlockedState.zero()
-		v.unlockedState = nil
-	}
-}
+	state = clearRuntimeState(state)
+	lockTimer = stopAutoLockTimer(lockTimer)
+	req.resp <- nil
 
-// scheduleLocking schedules the automatic lock timeout after a successful
-// unlock.
-//
-// This method must be called with v.mtx held.
-func (v *DBVault) scheduleLocking(timeout time.Duration) {
-	if timeout < 0 {
-		return
-	}
-
-	if timeout == 0 {
-		timeout = defaultVaultUnlockTimeout
-	}
-
-	v.timer.schedule(timeout, &v.mtx, v.clearRuntimeAndLock)
+	return state, lockTimer, nil
 }

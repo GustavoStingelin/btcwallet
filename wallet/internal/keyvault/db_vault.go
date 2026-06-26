@@ -2,7 +2,6 @@ package keyvault
 
 import (
 	"errors"
-	"sync"
 
 	"github.com/btcsuite/btcd/btcutil/hdkeychain"
 	"github.com/btcsuite/btcwallet/snacl"
@@ -25,15 +24,9 @@ type DBVault struct {
 	// walletID is the wallet row id that this vault is scoped to.
 	walletID uint32
 
-	// mtx guards concurrent access.
-	mtx sync.Mutex
-
-	// unlockedState holds sensitive runtime secret material that is only
-	// available when the vault is unlocked.
-	unlockedState *unlockedState
-
-	// timer automatically locks the vault after a successful unlock timeout.
-	timer autoLockTimer
+	// requests serializes all lock state, cryptographic operations, and
+	// auto-lock timer events through the vault actor loop.
+	requests chan any
 }
 
 // unlockedState holds sensitive runtime secret material.
@@ -54,10 +47,15 @@ var _ Vault = (*DBVault)(nil)
 
 // NewDBVault creates a key-vault bridge scoped to one wallet row.
 func NewDBVault(store db.Store, walletID uint32) *DBVault {
-	return &DBVault{
+	vault := &DBVault{
 		store:    store,
 		walletID: walletID,
+		requests: make(chan any),
 	}
+
+	go vault.mainLoop()
+
+	return vault
 }
 
 // zero clears the runtime secret material held by the unlocked state.

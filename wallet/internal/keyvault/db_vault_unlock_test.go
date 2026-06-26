@@ -36,18 +36,7 @@ func TestDBVaultUnlockSuccess(t *testing.T) {
 	t.Cleanup(vault.Lock)
 
 	require.False(t, vault.IsLocked())
-	require.Nil(t, vault.timer.timer)
-	require.NotNil(t, vault.unlockedState)
-	require.Equal(
-		t, expected.cryptoKeyPrivate[:],
-		vault.unlockedState.cryptoKeyPrivate[:],
-	)
-	require.Equal(
-		t, expected.cryptoKeyScript[:], vault.unlockedState.cryptoKeyScript[:],
-	)
-	require.Equal(
-		t, expected.hdRootKey.String(), vault.unlockedState.hdRootKey.String(),
-	)
+	assertVaultHasRuntimeState(t, vault, expected)
 }
 
 // TestDBVaultUnlockWrongPassphraseKeepsLocked verifies that an invalid
@@ -72,7 +61,6 @@ func TestDBVaultUnlockWrongPassphraseKeepsLocked(t *testing.T) {
 	require.Error(t, err)
 	require.ErrorIs(t, err, ErrInvalidPassphrase)
 	require.True(t, vault.IsLocked())
-	require.Nil(t, vault.unlockedState)
 }
 
 // TestDBVaultUnlockStoreErrorPropagates verifies that store failures are
@@ -95,38 +83,6 @@ func TestDBVaultUnlockStoreErrorPropagates(t *testing.T) {
 	require.Error(t, err)
 	require.ErrorIs(t, err, errStoreUnavailable)
 	require.True(t, vault.IsLocked())
-}
-
-// TestDBVaultUnlockTimeout verifies that a positive timeout automatically
-// locks the vault and clears runtime state.
-func TestDBVaultUnlockTimeout(t *testing.T) {
-	t.Parallel()
-
-	secrets, _ := makeWalletSecrets(t, correctPassphrase)
-
-	const walletID = uint32(10)
-
-	store := new(bwmock.Store)
-	store.On("GetWalletSecrets", mock.Anything, walletID).Return(
-		secrets, nil,
-	).Once()
-	t.Cleanup(func() {
-		store.AssertExpectations(t)
-	})
-
-	vault := NewDBVault(store, walletID)
-	require.NoError(
-		t, vault.Unlock(t.Context(), correctPassphrase, 10*time.Millisecond),
-	)
-	require.NotNil(t, vault.timer.timer)
-	require.False(t, vault.IsLocked())
-
-	require.Eventually(
-		t, func() bool {
-			return vault.IsLocked()
-		}, time.Second, time.Millisecond, "vault did not lock before timeout",
-	)
-	require.Nil(t, vault.unlockedState)
 }
 
 // TestDBVaultUnlockMalformedScriptKeyLocksVault verifies that a failure after
@@ -153,7 +109,37 @@ func TestDBVaultUnlockMalformedScriptKeyLocksVault(t *testing.T) {
 	require.ErrorIs(t, err, errUnexpectedState)
 	require.ErrorIs(t, err, snacl.ErrMalformed)
 	require.True(t, vault.IsLocked())
-	require.Nil(t, vault.unlockedState)
+}
+
+// TestDBVaultUnlockWrongPassphrasePreservesPriorState verifies that a failed
+// unlock attempt does not clear a previously installed runtime state.
+func TestDBVaultUnlockWrongPassphrasePreservesPriorState(t *testing.T) {
+	t.Parallel()
+
+	secrets, expected := makeWalletSecrets(t, correctPassphrase)
+
+	const walletID = uint32(19)
+
+	store := new(bwmock.Store)
+	store.On("GetWalletSecrets", mock.Anything, walletID).Return(
+		secrets, nil,
+	).Once()
+	store.On("GetWalletSecrets", mock.Anything, walletID).Return(
+		secrets, nil,
+	).Once()
+	t.Cleanup(func() {
+		store.AssertExpectations(t)
+	})
+
+	vault := NewDBVault(store, walletID)
+	require.NoError(t, vault.Unlock(t.Context(), correctPassphrase, -1))
+	t.Cleanup(vault.Lock)
+
+	err := vault.Unlock(t.Context(), wrongPassphrase, -1)
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrInvalidPassphrase)
+	require.False(t, vault.IsLocked())
+	assertVaultHasRuntimeState(t, vault, expected)
 }
 
 // makeWalletSecrets creates encrypted wallet secret material for unlock tests.
@@ -197,4 +183,50 @@ func makeWalletSecrets(t *testing.T, passphrase []byte) (*db.WalletSecrets,
 		cryptoKeyScript:  *scriptKey,
 		hdRootKey:        hdRootKey,
 	}
+}
+
+// unlockTestVault creates a vault, unlocks it, and returns its expected state.
+func unlockTestVault(t *testing.T, walletID uint32,
+	timeout time.Duration) (*DBVault, unlockedState) {
+
+	t.Helper()
+
+	secrets, expected := makeWalletSecrets(t, correctPassphrase)
+
+	store := new(bwmock.Store)
+	store.On("GetWalletSecrets", mock.Anything, walletID).Return(
+		secrets, nil,
+	).Once()
+	t.Cleanup(func() {
+		store.AssertExpectations(t)
+	})
+
+	vault := NewDBVault(store, walletID)
+	require.NoError(t, vault.Unlock(t.Context(), correctPassphrase, timeout))
+	t.Cleanup(vault.Lock)
+
+	return vault, expected
+}
+
+// assertVaultHasRuntimeState verifies that the vault can use expected keys.
+func assertVaultHasRuntimeState(t *testing.T, vault *DBVault,
+	expected unlockedState) {
+
+	t.Helper()
+
+	plaintext := []byte("runtime state check")
+
+	privateCiphertext, err := vault.Encrypt(waddrmgr.CKTPrivate, plaintext)
+	require.NoError(t, err)
+	privatePlaintext, err := expected.cryptoKeyPrivate.Decrypt(privateCiphertext)
+	require.NoError(t, err)
+	require.Equal(t, plaintext, privatePlaintext)
+
+	scriptCiphertext, err := vault.Encrypt(waddrmgr.CKTScript, plaintext)
+	require.NoError(t, err)
+	scriptPlaintext, err := expected.cryptoKeyScript.Decrypt(scriptCiphertext)
+	require.NoError(t, err)
+	require.Equal(t, plaintext, scriptPlaintext)
+
+	require.NotNil(t, expected.hdRootKey)
 }

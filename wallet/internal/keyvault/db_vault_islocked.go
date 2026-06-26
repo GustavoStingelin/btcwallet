@@ -1,9 +1,18 @@
 package keyvault
 
+// handleIsLockedReq reports whether the vault currently has unlocked runtime
+// state.
+func (v *DBVault) handleIsLockedReq(state *unlockedState, req vaultIsLockedReq) {
+	req.resp <- state == nil
+}
+
 // IsLocked reports whether the vault currently has unlocked runtime state.
 func (v *DBVault) IsLocked() bool {
-	v.mtx.Lock()
-	defer v.mtx.Unlock()
+	req := vaultIsLockedReq{
+		resp: make(vaultBoolResp, 1),
+	}
 
-	return v.unlockedState == nil
+	v.requests <- req
+
+	return <-req.resp
 }

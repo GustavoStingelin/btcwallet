@@ -14,39 +14,51 @@ import (
 func (v *DBVault) RefreshPrivatePassphrase(ctx context.Context,
 	passphrase []byte) error {
 
-	v.mtx.Lock()
-	defer v.mtx.Unlock()
+	req := vaultRefreshPrivatePassphraseReq{
+		ctx:        ctx,
+		passphrase: passphrase,
+		resp:       make(vaultErrResp, 1),
+	}
 
-	if v.unlockedState == nil {
+	err := v.sendReq(ctx, req)
+	if err != nil {
+		return err
+	}
+
+	return waitForErr(ctx, req.resp)
+}
+
+// handleRefreshPrivatePassphraseReq rotates persisted private secrets while
+// preserving runtime state.
+func (v *DBVault) handleRefreshPrivatePassphraseReq(state *unlockedState,
+	req vaultRefreshPrivatePassphraseReq) error {
+
+	if state == nil {
 		return fmt.Errorf("wallet %d vault RefreshPrivatePassphrase: %w",
 			v.walletID, ErrVaultLocked)
 	}
 
-	secrets, err := v.store.GetWalletSecrets(ctx, v.walletID)
+	secrets, err := v.store.GetWalletSecrets(req.ctx, v.walletID)
 	if err != nil {
 		return fmt.Errorf("wallet %d vault RefreshPrivatePassphrase: "+
 			"get secrets: %w", v.walletID, err)
 	}
 
-	updateParams, err := v.makeRotatedWalletSecrets(secrets, passphrase)
+	updateParams, err := v.makeRotatedWalletSecrets(
+		state, secrets, req.passphrase,
+	)
 	if err != nil {
 		return fmt.Errorf("wallet %d vault RefreshPrivatePassphrase: "+
 			"rotate secrets: %w", v.walletID, err)
 	}
 
-	// validate that the rotated secrets derive the same runtime keys before
-	// persisting them. This prevents storing secrets that would leave the vault
-	// unable to reproduce its current key material.
-	//
-	// this should only fail if there is a bug in this rotation path or in the
-	// underlying cryptographic implementation.
-	err = v.validateRotatedWalletSecrets(updateParams, passphrase)
+	err = validateRotatedWalletSecrets(state, updateParams, req.passphrase)
 	if err != nil {
 		return fmt.Errorf("wallet %d vault RefreshPrivatePassphrase: "+
 			"validate rotated secrets: %w", v.walletID, err)
 	}
 
-	err = v.store.UpdateWalletSecrets(ctx, updateParams)
+	err = v.store.UpdateWalletSecrets(req.ctx, updateParams)
 	if err != nil {
 		return fmt.Errorf("wallet %d vault RefreshPrivatePassphrase: "+
 			"update secrets: %w", v.walletID, err)
@@ -57,7 +69,7 @@ func (v *DBVault) RefreshPrivatePassphrase(ctx context.Context,
 
 // validateRotatedWalletSecrets confirms rotated persisted secrets decrypt with
 // the new passphrase to the same runtime keys already held in memory.
-func (v *DBVault) validateRotatedWalletSecrets(
+func validateRotatedWalletSecrets(currentState *unlockedState,
 	params db.UpdateWalletSecretsParams, passphrase []byte) error {
 
 	updatedSecrets := db.WalletSecrets{
@@ -73,7 +85,7 @@ func (v *DBVault) validateRotatedWalletSecrets(
 	}
 	defer validatedState.zero()
 
-	if !unlockedStateEqual(v.unlockedState, validatedState) {
+	if !unlockedStateEqual(currentState, validatedState) {
 		return fmt.Errorf("rotated secrets changed runtime keys: %w",
 			errUnexpectedState)
 	}
@@ -105,8 +117,9 @@ func unlockedStateEqual(a, b *unlockedState) bool {
 
 // makeRotatedWalletSecrets creates a persisted wallet secret update encrypted
 // with a new private passphrase from the currently unlocked runtime state.
-func (v *DBVault) makeRotatedWalletSecrets(secrets *db.WalletSecrets,
-	newPassphrase []byte) (db.UpdateWalletSecretsParams, error) {
+func (v *DBVault) makeRotatedWalletSecrets(state *unlockedState,
+	secrets *db.WalletSecrets, newPassphrase []byte) (
+	db.UpdateWalletSecretsParams, error) {
 
 	if secrets == nil {
 		return db.UpdateWalletSecretsParams{},
@@ -139,7 +152,7 @@ func (v *DBVault) makeRotatedWalletSecrets(secrets *db.WalletSecrets,
 
 	// third, reencrypt the already unlocked material and return it.
 	encryptedCryptoKeyPrivate, err := newMasterPrivateKey.Encrypt(
-		v.unlockedState.cryptoKeyPrivate[:],
+		state.cryptoKeyPrivate[:],
 	)
 	if err != nil {
 		return db.UpdateWalletSecretsParams{},
@@ -147,7 +160,7 @@ func (v *DBVault) makeRotatedWalletSecrets(secrets *db.WalletSecrets,
 	}
 
 	encryptedCryptoKeyScript, err := newMasterPrivateKey.Encrypt(
-		v.unlockedState.cryptoKeyScript[:],
+		state.cryptoKeyScript[:],
 	)
 	if err != nil {
 		return db.UpdateWalletSecretsParams{},
@@ -155,9 +168,9 @@ func (v *DBVault) makeRotatedWalletSecrets(secrets *db.WalletSecrets,
 	}
 
 	var encryptedHDRootKey []byte
-	if v.unlockedState.hdRootKey != nil {
-		encryptedHDRootKey, err = v.unlockedState.cryptoKeyPrivate.Encrypt(
-			[]byte(v.unlockedState.hdRootKey.String()),
+	if state.hdRootKey != nil {
+		encryptedHDRootKey, err = state.cryptoKeyPrivate.Encrypt(
+			[]byte(state.hdRootKey.String()),
 		)
 		if err != nil {
 			return db.UpdateWalletSecretsParams{},
