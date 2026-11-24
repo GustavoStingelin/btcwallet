@@ -958,6 +958,28 @@ func TestResolveMissingHistoricalBlockChainLookupError(t *testing.T) {
 	mockChain.AssertExpectations(t)
 }
 
+// expectStartupDisconnect requires the captured Wallet tip and fork to reach
+// the selective Store write. Heights beyond the returned hashes are absent.
+func expectStartupDisconnect(store *walletmock.Store, id uint32, tip db.Block,
+	fork db.Block, current []chainhash.Hash) {
+
+	proof := make(map[uint32]*chainhash.Hash)
+	for h := fork.Height + 1; h <= tip.Height; h++ {
+		i := h - fork.Height - 1
+
+		proof[h] = nil
+		if uint64(i) < uint64(len(current)) {
+			proof[h] = &current[i]
+		}
+	}
+
+	store.On("ListTxns", mock.Anything, db.ListTxnsQuery{
+		WalletID: id, StartHeight: fork.Height + 1, EndHeight: math.MaxInt32,
+	}).Return([]db.TxInfo(nil), nil).Once()
+	store.On("DisconnectBlock", mock.Anything, id, tip, &fork, proof).
+		Return(nil).Once()
+}
+
 // TestCheckRollbackDetected verifies checkRollback when reorg is detected.
 func TestCheckRollbackDetected(t *testing.T) {
 	t.Parallel()
@@ -1009,19 +1031,19 @@ func TestCheckRollbackDetected(t *testing.T) {
 	).Return(remoteHashes, nil).Once()
 
 	mockChain.On("GetBestBlock").
-		Return(&chainhash.Hash{}, int32(100), nil).Once()
+		Return(&remoteHashes[9], int32(100), nil).Twice()
 
 	// Mock header retrieval for the detected fork point at height 95.
 	forkHash := chainhash.Hash{byte(95)}
 	header := &wire.BlockHeader{Timestamp: time.Now()}
 	mockChain.On("GetBlockHeader", &forkHash).Return(header, nil).Once()
 
-	// Expect a single atomic rollback to the common ancestor: rewindToBlock
-	// rolls transaction state back and rewinds the sync tip together via
-	// RollbackToBlock for the rollback boundary (fork height 95 + 1).
-	store.On(
-		"RollbackToBlock", mock.Anything, s.walletID, uint32(96),
-	).Return(nil).Once()
+	// The Store gets only anchored hashes above the common ancestor.
+	expectDisconnectHeaders(mockChain, 96, forkHash, remoteHashes[5:]...)
+	expectStartupDisconnect(store, s.walletID,
+		db.Block{Height: 100, Hash: tip.Hash}, db.Block{
+			Height: 95, Hash: forkHash, Timestamp: header.Timestamp.UTC(),
+		}, remoteHashes[5:])
 
 	// Act: Compare the committed Store history against the diverging branch.
 	err := s.checkRollback(t.Context())
@@ -1072,11 +1094,14 @@ func TestCheckRollbackSparseFork(t *testing.T) {
 			Return([]chainhash.Hash{forkHash}, nil).Once()
 	}
 
-	client.On("GetBestBlock").Return(&tip.Hash, int32(100), nil).Times(3)
+	client.On("GetBestBlock").Return(&forkHash, int32(100), nil).Times(4)
 	client.On("GetBlockHeader", &forkHash).
 		Return(&wire.BlockHeader{Timestamp: time.Unix(98, 0)}, nil).Once()
-	store.On("RollbackToBlock", mock.Anything, s.walletID, uint32(99)).
-		Return(nil).Once()
+	current := []chainhash.Hash{forkHash, forkHash}
+	expectDisconnectHeaders(client, 99, forkHash, current...)
+	expectStartupDisconnect(store, s.walletID, tip, db.Block{
+		Height: 98, Hash: forkHash, Timestamp: time.Unix(98, 0).UTC(),
+	}, current)
 
 	// Act: Recover against the diverging sparse history using Store reads.
 	err := s.checkRollback(t.Context())
@@ -1126,13 +1151,14 @@ func TestCheckRollbackShorterTip(t *testing.T) {
 		remoteHashes = append(remoteHashes, chainhash.Hash{height})
 	}
 
-	client.On("GetBestBlock").Return(&forkHash, int32(90), nil).Twice()
+	client.On("GetBestBlock").Return(&forkHash, int32(90), nil).Times(3)
 	client.On("GetBlockHashes", int64(81), int64(90)).
 		Return(remoteHashes, nil).Once()
 	client.On("GetBlockHeader", &forkHash).
 		Return(&wire.BlockHeader{Timestamp: time.Unix(90, 0)}, nil).Once()
-	store.On("RollbackToBlock", mock.Anything, s.walletID, uint32(91)).
-		Return(nil).Once()
+	expectStartupDisconnect(store, s.walletID, tip, db.Block{
+		Height: 90, Hash: forkHash, Timestamp: time.Unix(90, 0).UTC(),
+	}, nil)
 
 	// Act: Compare the stored tip against the shorter current chain.
 	err := s.checkRollback(t.Context())
@@ -1180,15 +1206,20 @@ func TestCheckRollbackGenesisFork(t *testing.T) {
 			Hash: *chainParams.GenesisHash,
 		},
 	}, nil).Once()
-	client.On("GetBestBlock").Return(&tip.Hash, int32(10), nil).Twice()
+	client.On("GetBestBlock").Return(&chainhash.Hash{}, int32(10), nil).Times(3)
 	client.On("GetBlockHashes", int64(1), int64(10)).
 		Return(make([]chainhash.Hash, 10), nil).Once()
 	client.On("GetBlockHashes", int64(0), int64(0)).
 		Return([]chainhash.Hash{*chainParams.GenesisHash}, nil).Once()
 	client.On("GetBlockHeader", chainParams.GenesisHash).
 		Return(&chainParams.GenesisBlock.Header, nil).Once()
-	store.On("RollbackToBlock", mock.Anything, s.walletID, uint32(1)).
-		Return(nil).Once()
+
+	current := make([]chainhash.Hash, 10)
+	expectDisconnectHeaders(client, 1, *chainParams.GenesisHash, current...)
+	expectStartupDisconnect(store, s.walletID, tip, db.Block{
+		Hash:      *chainParams.GenesisHash,
+		Timestamp: chainParams.GenesisBlock.Header.Timestamp.UTC(),
+	}, current)
 
 	// Act: Search backwards beyond the mismatching first batch.
 	err := s.checkRollback(t.Context())
@@ -6886,33 +6917,6 @@ func TestSyncedBlockHashesRoutesStore(t *testing.T) {
 	store.AssertExpectations(t)
 }
 
-// TestRewindToBlockRoutesStore verifies the store rewind path issues a single
-// atomic RollbackToBlock for the rollback boundary, which rewinds the wallet
-// sync tip and rolls transaction state back together, rather than two
-// independent sync-tip and rollback writes.
-func TestRewindToBlockRoutesStore(t *testing.T) {
-	t.Parallel()
-
-	store := &walletmock.Store{}
-	s := newTestSyncer(Config{}, nil, nil, nil, &walletmock.Store{}, 0)
-	s.store = store
-	s.walletID = 99
-
-	fork := waddrmgr.BlockStamp{
-		Hash:      chainhash.Hash{99},
-		Height:    100,
-		Timestamp: time.Unix(1710003900, 0),
-	}
-
-	store.On(
-		"RollbackToBlock", mock.Anything, s.walletID, uint32(101),
-	).Return(nil).Once()
-
-	err := s.rewindToBlock(t.Context(), fork)
-	require.NoError(t, err)
-	store.AssertExpectations(t)
-}
-
 // TestScanWithRewindRoutesStoreRewind verifies manual rescans route through
 // the wallet-scoped Store rewind API when Store-backed sync reads are enabled.
 func TestScanWithRewindRoutesStoreRewind(t *testing.T) {
@@ -7867,7 +7871,7 @@ func TestCheckRollbackStoreSyncedTip(t *testing.T) {
 	}
 
 	mockChain.On("GetBestBlock").
-		Return(&chainhash.Hash{95}, int32(95), nil).Once()
+		Return(&chainhash.Hash{95}, int32(95), nil).Twice()
 	mockChain.On("GetBlockHashes", int64(91), int64(95)).
 		Return(remoteHashes, nil).Once()
 
@@ -7875,13 +7879,13 @@ func TestCheckRollbackStoreSyncedTip(t *testing.T) {
 	header := &wire.BlockHeader{Timestamp: time.Unix(95, 0).UTC()}
 	mockChain.On("GetBlockHeader", &forkHash).Return(header, nil).Once()
 
-	// The rollback is written atomically through the Store to the fork
-	// height plus one (96). RollbackToBlock derives the new sync tip from
-	// the stored fork-point block, so the caller only supplies the rollback
-	// boundary.
-	store.On(
-		"RollbackToBlock", mock.Anything, s.walletID, uint32(96),
-	).Return(nil).Once()
+	// The source ends at the fork. Every higher committed row must carry
+	// explicit absence into the same Wallet-scoped write.
+	expectStartupDisconnect(store, s.walletID, db.Block{
+		Height: 100, Hash: chainhash.Hash{1},
+	}, db.Block{
+		Height: 95, Hash: forkHash, Timestamp: header.Timestamp.UTC(),
+	}, nil)
 
 	// Act: Check the saved tip against the shorter current branch.
 	err := s.checkRollback(t.Context())
@@ -8486,7 +8490,7 @@ func TestScanBatchAncestry(t *testing.T) {
 	nextHash := next.BlockHash()
 
 	client.On("GetBestBlock").Unset()
-	client.On("GetBestBlock").Return(&nextHash, int32(2), nil).Times(5)
+	client.On("GetBestBlock").Return(&nextHash, int32(2), nil).Times(6)
 	client.On("GetBlockHashes", int64(2), int64(2)).
 		Return([]chainhash.Hash{nextHash}, nil).Once()
 	client.On("GetBlocks", []chainhash.Hash{nextHash}).
@@ -8497,6 +8501,9 @@ func TestScanBatchAncestry(t *testing.T) {
 	client.On("GetBlockHeader", chainParams.GenesisHash).Unset()
 	client.On("GetBlockHeader", chainParams.GenesisHash).
 		Return(&chainParams.GenesisBlock.Header, nil).Once()
+
+	expectDisconnectHeaders(client, 1, *chainParams.GenesisHash,
+		newHash, nextHash)
 
 	// Arrange: After rollback, the first block extends genesis, but the
 	// second still names a different parent. A later fetch returns a connected
@@ -8764,13 +8771,10 @@ func TestManagerRollbackKvdbSparseFork(t *testing.T) {
 	expectDisconnectHeaders(client, 2, fork.Hash, chainhash.Hash{22},
 		chainhash.Hash{33}, chainhash.Hash{44})
 
-	// Act on a known empty disconnected tip. Missing hashes must not hide
-	// the older mined orphan or require any discarded orphan header.
+	// Act on a missing height between the fork and the saved checkpoint.
+	// Its proof covers both the earlier payment and later manager hash.
 	err = s.processChainEvent(t.Context(), chainEvent{
-		notification: chain.BlockDisconnected{
-			Block: wtxmgr.Block{Height: 4, Hash: tip.Hash},
-			Time:  tip.Timestamp,
-		},
+		notification: chain.BlockDisconnected(reorgBlock(3)),
 	})
 
 	// Assert the full canonical fork stamp is retained and the older mined
@@ -8860,7 +8864,7 @@ func TestManagerRollbackKvdbEmptyAboveTip(t *testing.T) {
 	t.Parallel()
 
 	// Arrange a tip at 1 and wallet history at 2, with an empty orphan at 3.
-	// The separate producer regression proves these descending hashes arrive.
+	// A different confirmation on the replacement chain must stay mined.
 	s, mgr, conn := newStoreScanSyncer(t)
 	stamp := waddrmgr.BlockStamp{
 		Height:    1,
@@ -8868,7 +8872,9 @@ func TestManagerRollbackKvdbEmptyAboveTip(t *testing.T) {
 		Timestamp: time.Unix(1, 0).UTC(),
 	}
 	old := reorgBlock(2)
-	record := reorgRecord(t, 83)
+	record, payment := reorgRecord(t, 83), reorgRecord(t, 84)
+	retained := reorgBlock(4)
+	retained.Hash = chainhash.Hash{44}
 	err := walletdb.Update(conn, func(tx walletdb.ReadWriteTx) error {
 		err := mgr.SetSyncedTo(
 			tx.ReadWriteBucket(waddrmgrNamespaceKey), &stamp,
@@ -8877,9 +8883,14 @@ func TestManagerRollbackKvdbEmptyAboveTip(t *testing.T) {
 			return err
 		}
 
-		return s.txStore.InsertTx(
-			tx.ReadWriteBucket(wtxmgrNamespaceKey), record, &old,
-		)
+		ns := tx.ReadWriteBucket(wtxmgrNamespaceKey)
+
+		err = s.txStore.InsertTx(ns, record, &old)
+		if err != nil {
+			return err
+		}
+
+		return s.txStore.InsertTx(ns, payment, &retained)
 	})
 	require.NoError(t, err)
 
@@ -8888,31 +8899,38 @@ func TestManagerRollbackKvdbEmptyAboveTip(t *testing.T) {
 	t.Cleanup(func() { client.AssertExpectations(t) })
 
 	s.cfg.Chain = client
-	client.On("GetBestBlock").Return(&chainhash.Hash{33}, int32(3), nil).
+	client.On("GetBestBlock").Return(&retained.Hash, int32(4), nil).
 		Times(4)
 	client.On("GetBlockHash", int64(1)).Return(&stamp.Hash, nil).Twice()
 
 	for range 2 {
 		expectDisconnectHeaders(client, 2, stamp.Hash,
-			chainhash.Hash{22}, chainhash.Hash{33})
+			chainhash.Hash{22}, chainhash.Hash{33}, retained.Hash)
 	}
 
-	// Act on the unknown empty block first, then on the actual mined orphan.
+	// Act on the missing empty block before any lower disconnect arrives.
 	require.NoError(t, s.processChainEvent(t.Context(), chainEvent{
 		notification: chain.BlockDisconnected(reorgBlock(3)),
 	}))
-	require.NoError(t, s.processChainEvent(t.Context(), chainEvent{
-		notification: chain.BlockDisconnected(old),
-	}))
 
-	// Assert the lower matching notification detached its history without
-	// inventing any manager history or changing the earlier full stamp.
+	// Assert this event alone detaches the orphan, retains the canonical
+	// payment and preserves the earlier scan checkpoint.
 	info, err := s.store.GetTx(
 		t.Context(), db.GetTxQuery{Txid: record.Hash},
 	)
 	require.NoError(t, err)
 	require.Nil(t, info.Block)
 	require.Equal(t, stamp, mgr.SyncedTo())
+
+	info, err = s.store.GetTx(t.Context(), db.GetTxQuery{Txid: payment.Hash})
+	require.NoError(t, err)
+	require.NotNil(t, info.Block)
+	require.Equal(t, retained.Hash, info.Block.Hash)
+
+	// A later notification for the already-detached payment is harmless.
+	require.NoError(t, s.processChainEvent(t.Context(), chainEvent{
+		notification: chain.BlockDisconnected(old),
+	}))
 }
 
 // TestManagerRollbackKvdbCoinbaseDescendants preserves canonical coinbase
@@ -10052,6 +10070,89 @@ func TestSyncerRejectsBrokenDisconnectAncestry(t *testing.T) {
 	require.ErrorContains(t, eventErr, "disconnect ancestry changed")
 	require.NotErrorIs(t, eventErr, ErrStateChanged)
 	require.Equal(t, event, s.pendingEvent)
+}
+
+// TestSyncerStartupReconcilesKVDBHistory checks both branches when a live
+// payment replaces the mined identity at an abandoned manager checkpoint.
+func TestSyncerStartupReconcilesKVDBHistory(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: Commit progress on the old branch and a payment below its
+	// tip. Before startup checks that progress, deliver a payment from the
+	// replacement tip through the same path used during backend catch-up.
+	ctx := t.Context()
+	s, mgr, conn := newStoreScanSyncer(t)
+	fork := mgr.SyncedTo()
+	old, tip := reorgBlock(1), reorgBlock(2)
+	orphan, live := reorgRecord(t, 21), reorgRecord(t, 22)
+
+	err := walletdb.Update(conn, func(tx walletdb.ReadWriteTx) error {
+		ns := tx.ReadWriteBucket(waddrmgrNamespaceKey)
+		for _, block := range []wtxmgr.BlockMeta{old, tip} {
+			err := mgr.SetSyncedTo(ns, &waddrmgr.BlockStamp{
+				Height:    block.Height,
+				Hash:      block.Hash,
+				Timestamp: block.Time,
+			})
+			if err != nil {
+				return err
+			}
+		}
+
+		return s.txStore.InsertTx(
+			tx.ReadWriteBucket(wtxmgrNamespaceKey), orphan, &old,
+		)
+	})
+	require.NoError(t, err)
+
+	hashes, headers := linkedDisconnectHeaders(fork.Hash, 2, 7)
+	replacement := tip
+	replacement.Hash, replacement.Time = hashes[1], headers[1].Timestamp
+	err = s.processChainEventBeforeSync(ctx, chainEvent{
+		notification: chain.RelevantTx{
+			TxRecord: live,
+			Block:    &replacement,
+		},
+		matches: liveMatches(live),
+	})
+	require.NoError(t, err)
+
+	source := &bwmock.Chain{}
+	t.Cleanup(func() { source.AssertExpectations(t) })
+
+	s.cfg.Chain = source
+	source.On("GetBestBlock").Return(&replacement.Hash, int32(2), nil).
+		Twice()
+	source.On("GetBlockHashes", int64(0), int64(2)).
+		Return(append([]chainhash.Hash{fork.Hash}, hashes...), nil).Once()
+	source.On("GetBlockHeader", &fork.Hash).
+		Return(&wire.BlockHeader{Timestamp: fork.Timestamp}, nil).Once()
+	source.On("GetBlockHashes", int64(1), int64(2)).Return(hashes, nil).
+		Once()
+	source.On("GetBlockHeaders", hashes).Return(headers, nil).Once()
+
+	// Act: Recover from the saved checkpoint using the replacement headers.
+	err = s.checkRollback(ctx)
+
+	// Assert: Progress returns to the common fork. Only the earlier
+	// payment loses its confirmation. The replacement keeps its block.
+	require.NoError(t, err)
+
+	recovered := mgr.SyncedTo()
+	require.Equal(t, fork.Height, recovered.Height)
+	require.Equal(t, fork.Hash, recovered.Hash)
+	oldTx, err := s.store.GetTxDetail(ctx, db.GetTxDetailQuery{
+		Txid: orphan.Hash,
+	})
+	require.NoError(t, err)
+	require.Nil(t, oldTx.Block)
+
+	newTx, err := s.store.GetTxDetail(ctx, db.GetTxDetailQuery{
+		Txid: live.Hash,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, newTx.Block)
+	require.Equal(t, replacement.Hash, newTx.Block.Hash)
 }
 
 // TestSyncerCollectsDisconnectEvidence verifies the proof covers this Wallet's

@@ -2374,8 +2374,8 @@ func nonNegativeInt32ToUint32(value int32) uint32 {
 // previous is the complete retained canonical stamp; nil resets a matching
 // manager to its start block. The caller resolves immutable canonical entries
 // before the write: present nil means above the source tip, while an absent
-// affected height is unknown and aborts before mutation. Stale mined identities
-// are preserved independently of an exact manager-only rewind.
+// affected height is unknown and aborts before mutation. Missing observations
+// reconcile retained identities; only proven manager orphans rewind progress.
 func (s *Store) DisconnectBlock(_ context.Context, _ uint32, block db.Block,
 	previous *db.Block, canonical map[uint32]*chainhash.Hash) error {
 
@@ -2422,7 +2422,9 @@ func (s *Store) disconnectStoredHistory(tx walletdb.ReadWriteTx, block db.Block,
 		return nil, errMissingTxmgrNamespace
 	}
 
-	reconcile, rewind, err := s.disconnectedBlockMatches(tx, block, height)
+	reconcile, rewind, err := s.disconnectedBlockMatches(
+		tx, block, height, fork.Height, canonical,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -2498,7 +2500,8 @@ func (s *Store) disconnectBlockHistory(ns walletdb.ReadWriteBucket,
 // disconnectedBlockMatches separates history applicability from manager-only
 // rewinds so a stale disconnect cannot remove an already stored replacement.
 func (s *Store) disconnectedBlockMatches(tx walletdb.ReadTx, block db.Block,
-	height int32) (bool, bool, error) {
+	height, forkHeight int32, canonical map[uint32]*chainhash.Hash) (
+	bool, bool, error) {
 
 	stored, err := s.txStore.BlockHash(
 		tx.ReadBucket(wtxmgrNamespaceKey), height,
@@ -2507,25 +2510,56 @@ func (s *Store) disconnectedBlockMatches(tx walletdb.ReadTx, block db.Block,
 		return false, false, err
 	}
 
-	managerMatches := false
-	if s.addrStore != nil && height <= s.addrStore.SyncedTo().Height {
-		hash, err := s.addrStore.BlockHash(
-			tx.ReadBucket(waddrmgr.NamespaceKey), height,
-		)
-		switch {
-		case err == nil:
-			managerMatches = *hash == block.Hash
+	// Either index can still identify the abandoned block.
+	ns := tx.ReadBucket(waddrmgr.NamespaceKey)
 
-		case !waddrmgr.IsError(err, waddrmgr.ErrBlockNotFound):
+	var managerHash *chainhash.Hash
+	if s.addrStore != nil && height <= s.addrStore.SyncedTo().Height {
+		managerHash, err = s.addrStore.BlockHash(ns, height)
+		if err != nil && !waddrmgr.IsError(err, waddrmgr.ErrBlockNotFound) {
 			return false, false, err
 		}
 	}
 
-	// A known empty manager block permits descendant reconciliation, while
-	// competing mined history permits only the independent manager rewind.
-	if stored != nil {
-		return *stored == block.Hash, managerMatches, nil
+	if stored != nil || managerHash != nil {
+		matches := block.Hash.IsEqual(managerHash)
+		return matches || block.Hash.IsEqual(stored), matches, nil
 	}
 
-	return managerMatches, managerMatches, nil
+	// Both indexes missed the event, but older confirmations may remain.
+	rewind, err := s.hasOrphanedManagerBlock(ns, forkHeight, canonical)
+
+	return true, rewind, err
+}
+
+// hasOrphanedManagerBlock checks every retained hash above the fork. Missing
+// proof invalidates the write even after an earlier mismatch.
+func (s *Store) hasOrphanedManagerBlock(ns walletdb.ReadBucket,
+	forkHeight int32, canonical map[uint32]*chainhash.Hash) (bool, error) {
+
+	if s.addrStore == nil {
+		return false, nil
+	}
+
+	rewind := false
+	for h := s.addrStore.SyncedTo().Height; h > forkHeight; h-- {
+		hash, err := s.addrStore.BlockHash(ns, h)
+		if waddrmgr.IsError(err, waddrmgr.ErrBlockNotFound) {
+			continue
+		}
+
+		if err != nil {
+			return false, err
+		}
+
+		current, known := canonical[nonNegativeInt32ToUint32(h)]
+		if !known {
+			return false, fmt.Errorf("%w: unknown canonical "+
+				"block at %d", db.ErrInvalidParam, h)
+		}
+
+		rewind = rewind || !hash.IsEqual(current)
+	}
+
+	return rewind, nil
 }
