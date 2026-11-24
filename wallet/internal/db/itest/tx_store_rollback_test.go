@@ -310,3 +310,136 @@ func TestRollbackToBlockRewindsSyncTipAndRollsBack(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, otherOutputs, otherOutputsAfter)
 }
+
+// TestDisconnectBlockIdentities checks the observed-disconnect guard separately
+// from height rollback, including a height with no transaction to classify it.
+func TestDisconnectBlockIdentities(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name       string
+		storedHash chainhash.Hash
+		forkDelta  byte
+		forkHeight uint32
+		proof      map[uint32]*chainhash.Hash
+		wantRewind bool
+		wantErr    error
+	}{
+		{
+			name:       "matching orphan",
+			forkHeight: 1,
+			storedHash: chainhash.Hash{2},
+			proof:      map[uint32]*chainhash.Hash{2: {4}},
+			wantRewind: true,
+		},
+		{
+			name:       "stale after replacement with unrelated fork",
+			forkDelta:  1,
+			forkHeight: 1,
+			storedHash: chainhash.Hash{3},
+			proof:      map[uint32]*chainhash.Hash{2: {4}},
+		},
+		{
+			name:       "wrong fork hash",
+			forkHeight: 1,
+			storedHash: chainhash.Hash{2},
+			forkDelta:  1,
+			proof:      map[uint32]*chainhash.Hash{2: {4}},
+			wantErr:    db.ErrBlockMismatch,
+		},
+		{
+			name:       "successor offered as fork",
+			forkHeight: 3,
+			storedHash: chainhash.Hash{2},
+			proof:      map[uint32]*chainhash.Hash{2: {4}},
+			wantErr:    db.ErrInvalidParam,
+		},
+		{
+			name:       "unknown empty height",
+			forkHeight: 1,
+			storedHash: chainhash.Hash{2},
+			wantErr:    db.ErrInvalidParam,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			// Arrange: The observed height has no transactions. Its owned
+			// block identity and explicit canonical evidence must decide
+			// whether both references rewind, without touching the sibling.
+			store := NewTestStore(t)
+			walletID := newWallet(t, store, "disconnect-owner")
+			fork := CreateBlockFixture(t, store.Queries(), walletID, 1)
+			disconnected := db.Block{
+				Height:    2,
+				Hash:      chainhash.Hash{2},
+				Timestamp: time.Unix(2, 0).UTC(),
+			}
+			stored := disconnected
+			stored.Hash = tc.storedHash
+			err := store.UpdateWallet(t.Context(), db.UpdateWalletParams{
+				WalletID:      walletID,
+				SyncedTo:      &stored,
+				BirthdayBlock: &stored,
+			})
+			require.NoError(t, err)
+			otherID := newWallet(t, store, "disconnect-sibling")
+			otherBlock := disconnected
+			otherBlock.Hash = chainhash.Hash{99}
+			err = store.UpdateWallet(t.Context(), db.UpdateWalletParams{
+				WalletID: otherID, SyncedTo: &otherBlock,
+			})
+			require.NoError(t, err)
+			otherBefore, err := store.GetWallet(
+				t.Context(), "disconnect-sibling",
+			)
+			require.NoError(t, err)
+
+			// Both possible destinations exist. Each case supplies the
+			// selected height and may change its hash to model stale proof.
+			successor := CreateBlockFixture(t, store.Queries(), walletID, 3)
+			destinations := map[uint32]db.Block{1: fork, 3: successor}
+			previous := destinations[tc.forkHeight]
+			previous.Hash[0] ^= tc.forkDelta
+
+			// Act: Submit the observed block and claimed fork in one write.
+			err = store.DisconnectBlock(t.Context(), walletID,
+				disconnected, &previous, tc.proof)
+
+			// Assert: Only a proven matching orphan rewinds; both rejected
+			// evidence and a delayed old event preserve the installed tip.
+			require.ErrorIs(t, err, tc.wantErr)
+			current, err := store.GetWallet(
+				t.Context(), "disconnect-owner",
+			)
+			require.NoError(t, err)
+
+			want := stored
+			if tc.wantRewind {
+				want = fork
+			}
+
+			require.Equal(t, want.Height, current.SyncedTo.Height)
+			require.Equal(t, want.Hash, current.SyncedTo.Hash)
+			require.Equal(t, current.SyncedTo, current.BirthdayBlock)
+
+			// Reading the retained row also detects history deletion hidden
+			// behind an otherwise unchanged checkpoint.
+			blocks, err := store.ListSyncedBlocks(
+				t.Context(), db.ListSyncedBlocksQuery{
+					WalletID: walletID, StartHeight: want.Height,
+					EndHeight: want.Height,
+				},
+			)
+			require.NoError(t, err)
+			require.Len(t, blocks, 1)
+			require.Equal(t, want.Hash, blocks[0].Hash)
+
+			otherAfter, err := store.GetWallet(
+				t.Context(), "disconnect-sibling",
+			)
+			require.NoError(t, err)
+			require.Equal(t, otherBefore, otherAfter)
+		})
+	}
+}
