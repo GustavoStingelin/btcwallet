@@ -288,7 +288,7 @@ func (m *Manager) startWallets(ctx context.Context) ([]*Wallet, error) {
 	// Enroll the complete durable set before the first native watch can
 	// emit a payment shared with another Wallet.
 	for _, wallet := range wallets {
-		err = wallet.start(ctx)
+		err = m.startWallet(ctx, wallet)
 		if err != nil {
 			return wallets, err
 		}
@@ -299,6 +299,16 @@ func (m *Manager) startWallets(ctx context.Context) ([]*Wallet, error) {
 	}
 
 	return wallets, nil
+}
+
+// startWallet supplies the backend's startup watches before worker activation.
+func (m *Manager) startWallet(ctx context.Context, w *Wallet) error {
+	watches, err := m.backend.loadStartupWatchSet(ctx, w.id)
+	if err != nil {
+		return err
+	}
+
+	return w.start(ctx, watches)
 }
 
 // stopWallets stops all Wallets before closing storage. The slice holds Wallets
@@ -560,10 +570,9 @@ func (m *Manager) handleCreateWalletReq(req createWalletReq) error {
 		return nil
 	}
 
-	err = wallet.importInitialAccounts(ctx, params.InitialAccounts)
+	done, err := m.activateCreatedWallet(ctx, wallet, params)
 	if err != nil {
-		// Serialize cleanup with Start. Stop may have claimed shutdown;
-		// it joins us and observes closed storage, avoiding double disposal.
+		// Serialize disposal with Stop before answering the caller.
 		m.Lock()
 		err = errors.Join(err, m.stopWallets([]*Wallet{wallet}))
 		m.Unlock()
@@ -573,25 +582,7 @@ func (m *Manager) handleCreateWalletReq(req createWalletReq) error {
 		return err
 	}
 
-	var done <-chan struct{}
-
-	done, err = wallet.enrollChainEvents()
-	if err == nil {
-		err = wallet.start(ctx)
-	}
-	if err != nil {
-		// Failed startup needs the same serialized disposal and reply.
-		m.Lock()
-		err = errors.Join(err, m.stopWallets([]*Wallet{wallet}))
-		m.Unlock()
-
-		req.resp <- createWalletResp{err: err}
-
-		return err
-	}
-
-	// A source may already have stopped before the first successful Create.
-	// Once published, this Wallet lives until joined Manager disposal.
+	// The first active subscription also signals source loss to Manager.
 	if m.walletSubDone == nil {
 		m.walletSubDone = done
 	}
@@ -600,6 +591,34 @@ func (m *Manager) handleCreateWalletReq(req createWalletReq) error {
 	req.resp <- createWalletResp{wallet: wallet}
 
 	return nil
+}
+
+// activateCreatedWallet enrolls the candidate before its watches go live.
+func (m *Manager) activateCreatedWallet(ctx context.Context, wallet *Wallet,
+	params CreateWalletParams) (<-chan struct{}, error) {
+
+	err := wallet.importInitialAccounts(ctx, params.InitialAccounts)
+	if err != nil {
+		return nil, err
+	}
+
+	done, err := wallet.enrollChainEvents()
+	if err != nil {
+		return nil, err
+	}
+
+	err = m.startWallet(ctx, wallet)
+	if err != nil {
+		return nil, err
+	}
+
+	// Registration can succeed after the source has stopped delivering.
+	select {
+	case <-done:
+		return nil, ErrWalletShuttingDown
+	default:
+		return done, nil
+	}
 }
 
 // createWallet validates and prepares a durable candidate. Its caller owns

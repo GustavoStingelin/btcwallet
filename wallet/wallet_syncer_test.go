@@ -8165,6 +8165,8 @@ func newLiveWatchManager(t *testing.T) (*Manager, *bwmock.Chain, *Wallet,
 		Return(chain.EventSubscription{Events: notifications}).Once()
 	manager := testSQLiteManagerWithChain(t, client)
 	client.On("WatchAddrsFromTip", mock.Anything, mock.Anything).Unset()
+	client.On("WatchAddrsFromTip", mock.Anything, []address.Address(nil)).
+		Return(nil).Once()
 	client.On("NotifySpent", mock.Anything).Unset()
 
 	params := sqliteCreateParams(t)

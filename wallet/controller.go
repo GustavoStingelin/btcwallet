@@ -185,7 +185,7 @@ func (w *Wallet) enrollChainEvents() (<-chan struct{}, error) {
 // start prepares runtime data and starts the Wallet's existing workers using
 // its construction lifetime. Setup failure leaves the instance terminal;
 // Manager publishes the candidate only after this method succeeds.
-func (w *Wallet) start(startCtx context.Context) error {
+func (w *Wallet) start(startCtx context.Context, watches *db.WatchSet) error {
 	// 1. Enter Starting so setup failure makes this Wallet terminal.
 	err := w.state.toStarting()
 	if err != nil {
@@ -197,7 +197,7 @@ func (w *Wallet) start(startCtx context.Context) error {
 	// We use startCtx here because these operations must complete
 	// synchronously before the wallet is considered "started". If
 	// startCtx is canceled, the startup sequence aborts.
-	err = w.performRuntimeSetup(startCtx)
+	err = w.performRuntimeSetup(startCtx, watches)
 	if err != nil {
 		// Cleanup resources.
 		w.cancel()
@@ -322,7 +322,9 @@ func (w *Wallet) waitForBackoff(startTime time.Time, backoff time.Duration,
 // before the wallet's main loops can start. This includes sanity checking the
 // birthday block, fail-fast verifying that the wallet's accounts can be read
 // from the store, and cleaning up expired locks.
-func (w *Wallet) performRuntimeSetup(startCtx context.Context) error {
+func (w *Wallet) performRuntimeSetup(startCtx context.Context,
+	watches *db.WatchSet) error {
+
 	// Perform the birthday sanity check synchronously to ensure we are
 	// connected and our status is valid before starting the main loop.
 	//
@@ -350,6 +352,12 @@ func (w *Wallet) performRuntimeSetup(startCtx context.Context) error {
 	err = w.store.DeleteExpiredLeases(startCtx, w.id)
 	if err != nil {
 		return fmt.Errorf("delete expired leases: %w", err)
+	}
+
+	// Birthday setup above sets Neutrino's native scan start time. Install
+	// live interests only after it is set and before workers are launched.
+	if watches != nil {
+		return w.sync.installLiveWatches(startCtx, *watches)
 	}
 
 	return nil

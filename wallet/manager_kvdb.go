@@ -172,6 +172,14 @@ func (b *kvdbManagerBackend) open(ctx context.Context, walletName string,
 	return data, nil
 }
 
+// loadStartupWatchSet leaves legacy KVDB registration on its existing
+// background synchronization path.
+func (b *kvdbManagerBackend) loadStartupWatchSet(context.Context,
+	uint32) (*db.WatchSet, error) {
+
+	return nil, nil //nolint:nilnil // KVDB installs watches during catch-up.
+}
+
 // close releases the legacy address manager before its physical database.
 func (b *kvdbManagerBackend) close() error {
 	if b.addressMgr != nil {

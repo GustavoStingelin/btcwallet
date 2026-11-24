@@ -27,6 +27,10 @@ type managerBackend interface {
 	create(ctx context.Context, params CreateWalletParams,
 		rootKey *hdkeychain.ExtendedKey) (*walletData, error)
 
+	// loadStartupWatchSet returns any persistent interests that must be
+	// registered before admission. A nil set leaves setup to catch-up.
+	loadStartupWatchSet(ctx context.Context, id uint32) (*db.WatchSet, error)
+
 	// close releases the database and any live managers owned by the backend.
 	close() error
 }

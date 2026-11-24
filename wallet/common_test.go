@@ -168,6 +168,11 @@ func testSQLiteManagerWithChain(tb testing.TB, chain *bwmock.Chain) *Manager {
 func testSQLManager(tb testing.TB, store *walletmock.Store) *Manager {
 	tb.Helper()
 
+	// This fixture covers both rejected and admitted SQL candidates. Each
+	// admitted candidate may load its interests from the supplied mock.
+	store.On("LoadWatchSet", mock.Anything, mock.AnythingOfType("uint32")).
+		Return(db.WatchSet{}, nil).Maybe()
+
 	// Match the service lifetime; the existing Stop cleanup cancels and joins.
 	lifetimeCtx, cancel := context.WithCancel(context.Background())
 	m := &Manager{
@@ -461,7 +466,7 @@ func createStartedWalletWithID(t *testing.T, walletID uint32) (*Wallet,
 	expectStopTeardown(deps)
 
 	// Start the wallet.
-	require.NoError(t, w.start(t.Context()))
+	require.NoError(t, w.start(t.Context(), nil))
 
 	t.Cleanup(func() {
 		require.NoError(t, w.stop())

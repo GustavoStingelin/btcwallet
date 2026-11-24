@@ -10,6 +10,7 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/btcsuite/btcd/address/v2"
 	"github.com/btcsuite/btcd/btcutil/v2/hdkeychain"
 	"github.com/btcsuite/btcd/chaincfg/v2"
 	"github.com/btcsuite/btcd/chainhash/v2"
@@ -726,6 +727,16 @@ func (b *managerBackendMock) create(ctx context.Context,
 	return args.Get(0).(*walletData), args.Error(1)
 }
 
+// loadStartupWatchSet exposes the storage read performed before activation.
+func (b *managerBackendMock) loadStartupWatchSet(ctx context.Context,
+	id uint32) (*db.WatchSet, error) {
+
+	args := b.Called(ctx, id)
+	set, _ := args.Get(0).(*db.WatchSet)
+
+	return set, args.Error(1)
+}
+
 // close returns the configured backend ownership-release result.
 func (b *managerBackendMock) close() error {
 	args := b.Called()
@@ -800,6 +811,11 @@ func TestManagerStartStopPublishesStableSet(t *testing.T) {
 	backend.On("close").Return(nil).Once()
 
 	source := &bwmock.Chain{}
+
+	backend.On("loadStartupWatchSet", mock.Anything, uint32(1)).
+		Return((*db.WatchSet)(nil), nil).Once()
+	backend.On("loadStartupWatchSet", mock.Anything, uint32(2)).
+		Return((*db.WatchSet)(nil), nil).Once()
 	source.On("SubscribeChainEvents", mock.Anything).
 		Return(chain.EventSubscription{}).Twice()
 	manager := newManagerLifecycleTest(t, backend, source)
@@ -856,12 +872,12 @@ func TestManagerStartStopPublishesStableSet(t *testing.T) {
 func TestManagerStartFailureCleansPartialSet(t *testing.T) {
 	t.Parallel()
 
-	// Arrange: The second Wallet fails its birthday read. Hold the first
+	// Arrange: The second Wallet cannot activate its live watch. Hold the first
 	// Wallet's real vault cleanup so the primary error cannot escape before
 	// the original call finishes cleaning up its partially started set.
 	_, firstDeps := createTestWalletWithMocks(t)
 	_, secondDeps := createTestWalletWithMocks(t)
-	startErr := errors.New("birthday unavailable")
+	startErr := errors.New("native watch failed")
 
 	firstDeps.store.On("GetWallet", mock.Anything, "first").Return(
 		&db.WalletInfo{BirthdayBlock: &db.Block{}}, nil,
@@ -872,7 +888,12 @@ func TestManagerStartFailureCleansPartialSet(t *testing.T) {
 	firstDeps.store.On("DeleteExpiredLeases", mock.Anything, uint32(1)).
 		Return(nil).Once()
 	secondDeps.store.On("GetWallet", mock.Anything, "second").
-		Return(nil, startErr).Once()
+		Return(&db.WalletInfo{BirthdayBlock: &db.Block{}}, nil).Once()
+	secondDeps.store.On("ListAccounts", mock.Anything, db.ListAccountsQuery{
+		WalletID: 2,
+	}).Return([]db.AccountInfo{}, nil).Once()
+	secondDeps.store.On("DeleteExpiredLeases", mock.Anything, uint32(2)).
+		Return(nil).Once()
 
 	cleanupEntered := make(chan struct{})
 	releaseCleanup := make(chan struct{})
@@ -899,6 +920,13 @@ func TestManagerStartFailureCleansPartialSet(t *testing.T) {
 	backend.On("close").Return(nil).Once()
 
 	source := &bwmock.Chain{}
+
+	backend.On("loadStartupWatchSet", mock.Anything, uint32(1)).
+		Return((*db.WatchSet)(nil), nil).Once()
+	backend.On("loadStartupWatchSet", mock.Anything, uint32(2)).
+		Return(&db.WatchSet{}, nil).Once()
+	source.On("WatchAddrsFromTip", mock.Anything, []address.Address(nil)).
+		Return(startErr).Once()
 	source.On("SubscribeChainEvents", mock.Anything).
 		Return(chain.EventSubscription{}).Twice()
 	manager := newManagerLifecycleTest(t, backend, source)
@@ -1452,6 +1480,9 @@ func TestManagerCreateLifecycleSerializesStop(t *testing.T) {
 	backend.On("close").Return(nil).Once().NotBefore(vaultLock)
 
 	source := &bwmock.Chain{}
+
+	backend.On("loadStartupWatchSet", mock.Anything, uint32(1)).
+		Return((*db.WatchSet)(nil), nil).Once()
 	source.On("SubscribeChainEvents", mock.Anything).
 		Return(chain.EventSubscription{}).Once()
 
@@ -1545,6 +1576,9 @@ func TestManagerCreateLifecycleStartFailureStopsManager(t *testing.T) {
 	}).Return(closeErr).Once()
 
 	source := &bwmock.Chain{}
+
+	backend.On("loadStartupWatchSet", mock.Anything, uint32(1)).
+		Return((*db.WatchSet)(nil), nil).Once()
 	source.On("SubscribeChainEvents", mock.Anything).
 		Return(chain.EventSubscription{}).Once()
 	manager := newManagerLifecycleTest(t, backend, source)
@@ -1930,6 +1964,9 @@ func TestManagerCreateBoundsGenesisSecrets(t *testing.T) {
 			backend.On("close").Return(nil).Once()
 
 			source := &bwmock.Chain{}
+
+			backend.On("loadStartupWatchSet", mock.Anything, uint32(1)).
+				Return((*db.WatchSet)(nil), nil).Once()
 			source.On("SubscribeChainEvents", mock.Anything).
 				Return(chain.EventSubscription{}).Once()
 
@@ -2481,6 +2518,11 @@ func TestManagerChainSourceClosed(t *testing.T) {
 
 	done := make(chan struct{})
 	source := &bwmock.Chain{}
+
+	backend.On("loadStartupWatchSet", mock.Anything, uint32(1)).
+		Return((*db.WatchSet)(nil), nil).Once()
+	backend.On("loadStartupWatchSet", mock.Anything, uint32(2)).
+		Return((*db.WatchSet)(nil), nil).Once()
 	source.On("SubscribeChainEvents", mock.Anything).
 		Return(chain.EventSubscription{Done: done}).Twice()
 	manager := newManagerLifecycleTest(t, backend, source)
@@ -2557,6 +2599,40 @@ func TestManagerJoinsWalletOnSourceLoss(t *testing.T) {
 	// Assert: The worker has settled and joined disposal closed the Store.
 	require.Equal(t, lifecycleStopped, lifecycle(w.state.lifecycle.Load()))
 	require.Nil(t, m.backend)
+}
+
+// TestManagerRejectsStreamEndedDuringWatchActivation checks the last
+// admission boundary while the candidate and its workers are still private.
+func TestManagerRejectsStreamEndedDuringWatchActivation(t *testing.T) {
+	t.Parallel()
+
+	// Arrange an enrolled SQLite Wallet whose source stops during the
+	// synchronous watch call. Registration itself reports success.
+	client := createTestChain(t)
+	done := make(chan struct{})
+	events := make(chan any)
+
+	client.On("SubscribeChainEvents", mock.Anything).Unset()
+	client.On("SubscribeChainEvents", mock.Anything).
+		Return(chain.EventSubscription{Events: events, Done: done}).Once()
+	client.On("WatchAddrsFromTip", mock.Anything, mock.Anything).Unset()
+	client.On("WatchAddrsFromTip", mock.Anything, mock.Anything).
+		Run(func(mock.Arguments) {
+			close(events)
+			close(done)
+		}).Return(nil).Once()
+	m := testSQLiteManagerWithChain(t, client)
+
+	// Act through normal admission so the watch callback runs between
+	// enrollment and the Manager's decision to publish the Wallet.
+	w, err := m.Create(sqliteCreateParams(t))
+
+	// Assert the caller sees the source failure and joined cleanup leaves
+	// no candidate in the Manager's published membership.
+	require.ErrorIs(t, err, ErrWalletShuttingDown)
+	require.Nil(t, w)
+	m.wg.Wait()
+	require.Empty(t, m.wallets)
 }
 
 // TestManagerRejectsEndedEnrollment ensures an empty Manager can start

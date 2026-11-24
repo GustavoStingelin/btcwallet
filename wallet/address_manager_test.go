@@ -2659,11 +2659,13 @@ func TestNewBulkAddressesFinishesCommittedWatch(t *testing.T) {
 func TestNewBulkAddressesReplaysCommittedBatch(t *testing.T) {
 	t.Parallel()
 
-	// Arrange: Keep the first backend non-current so only the public batch
-	// call registers; its failure captures the committed destinations.
+	// Arrange: Admit the empty Wallet before the first backend is current.
+	// Fail the later address allocation watch to retain its committed batch.
 	path := filepath.Join(t.TempDir(), "reopen.sqlite")
 	chainMock := createTestChain(t)
 	chainMock.On("WatchAddrsFromTip", mock.Anything, mock.Anything).Unset()
+	chainMock.On("WatchAddrsFromTip", mock.Anything, []address.Address(nil)).
+		Return(nil).Once()
 
 	openManager := func(chainSource chain.Interface) *Manager {
 		m, err := NewManager(t.Context(), ManagerConfig{
@@ -2723,7 +2725,7 @@ func TestNewBulkAddressesReplaysCommittedBatch(t *testing.T) {
 	freshChain.On("WatchAddrsFromTip", mock.Anything, mock.Anything).
 		Run(func(args mock.Arguments) {
 			restored, _ = args.Get(1).([]address.Address)
-		}).Return(nil).Once()
+		}).Return(nil).Twice()
 	freshChain.On("NotifyBlocks").Run(func(mock.Arguments) {
 		replayed <- restored
 	}).Return(nil).Once()
@@ -3271,6 +3273,8 @@ func TestNewAddressSQLiteConcurrentEmptyBranch(t *testing.T) {
 	// returned; later registrations succeed immediately.
 	chainMock := createTestChain(t)
 	chainMock.On("WatchAddrsFromTip", mock.Anything, mock.Anything).Unset()
+	chainMock.On("WatchAddrsFromTip", mock.Anything, []address.Address(nil)).
+		Return(nil).Once()
 
 	path := filepath.Join(t.TempDir(), "concurrent.sqlite")
 	_, w := newReceivingSQLiteWallet(t, path, chainMock)

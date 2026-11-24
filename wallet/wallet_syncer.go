@@ -237,6 +237,9 @@ type chainProcessor interface {
 	// bindChainEvents connects the native stream before the worker starts.
 	bindChainEvents(events <-chan any)
 
+	// installLiveWatches activates committed interests on the native client.
+	installLiveWatches(ctx context.Context, watches db.WatchSet) error
+
 	// run executes the main synchronization loop.
 	run(ctx context.Context) error
 
@@ -322,6 +325,14 @@ func (s *syncer) refreshLiveWatches(ctx context.Context) error {
 		return fmt.Errorf("read watch set: %w", err)
 	}
 
+	return s.installLiveWatches(ctx, watches)
+}
+
+// installLiveWatches uses one committed snapshot for admission and retries.
+// Register addresses first, then spend notifications for any known outputs.
+func (s *syncer) installLiveWatches(ctx context.Context,
+	watches db.WatchSet) error {
+
 	var addrs []address.Address
 	// Preserve the existing nil-address registration for empty snapshots.
 	if len(watches.AddressScripts) > 0 {
@@ -339,7 +350,7 @@ func (s *syncer) refreshLiveWatches(ctx context.Context) error {
 
 	// Wallet shutdown must still cancel registration. A later sync
 	// initialization reads the persisted watch set again.
-	err = s.cfg.Chain.WatchAddrsFromTip(ctx, addrs)
+	err := s.cfg.Chain.WatchAddrsFromTip(ctx, addrs)
 	if err != nil {
 		return fmt.Errorf("register addresses: %w", err)
 	}

@@ -12,6 +12,7 @@ import (
 	"github.com/btcsuite/btcd/btcutil/v2"
 	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/btcsuite/btcwallet/waddrmgr"
+	"github.com/btcsuite/btcwallet/wallet/internal/db"
 	"github.com/stretchr/testify/mock"
 )
 
@@ -118,6 +119,13 @@ type mockChainProcessor struct {
 // A compile-time assertion to ensure that mockChainProcessor implements the
 // chainProcessor interface.
 var _ chainProcessor = (*mockChainProcessor)(nil)
+
+// installLiveWatches exposes the native readiness boundary to controller tests.
+func (m *mockChainProcessor) installLiveWatches(ctx context.Context,
+	set db.WatchSet) error {
+
+	return m.Called(ctx, set).Error(0)
+}
 
 // bindChainEvents records the stream handed to the worker during admission.
 func (m *mockChainProcessor) bindChainEvents(events <-chan any) {

@@ -92,6 +92,19 @@ func (b *sqlManagerBackend) walletData(
 	}, nil
 }
 
+// loadStartupWatchSet reads both Wallet interest groups in one snapshot.
+// Even an empty SQL Wallet activates native address observation at admission.
+func (b *sqlManagerBackend) loadStartupWatchSet(ctx context.Context,
+	id uint32) (*db.WatchSet, error) {
+
+	set, err := b.store.LoadWatchSet(ctx, id)
+	if err != nil {
+		return nil, fmt.Errorf("load startup watches: %w", err)
+	}
+
+	return &set, nil
+}
+
 // close releases the SQL Store when this backend owns it.
 func (b *sqlManagerBackend) close() error {
 	if b.closeFn == nil {
