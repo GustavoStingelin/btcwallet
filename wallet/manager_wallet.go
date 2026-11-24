@@ -32,15 +32,7 @@ func newManagedWallet(cfg Config, data *walletData) *Wallet {
 		isWatchOnly:       data.isWatchOnly,
 	}
 
-	// Allocate routing admission before the Wallet can be published. Its
-	// existing sync worker remains the sole event processor.
-	w.chainEventChan = make(chan any, 1)
-
-	processor := newSyncer(
-		cfg, w.addrStore, w.txStore, w, w.store, w.id,
-		w.chainEventChan,
-	)
-	w.sync = processor
+	w.sync = newSyncer(cfg, w.addrStore, w.txStore, w, w.store, w.id)
 	w.state = newWalletState(w.sync)
 
 	return w

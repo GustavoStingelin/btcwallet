@@ -2727,7 +2727,9 @@ func TestNewBulkAddressesReplaysCommittedBatch(t *testing.T) {
 	freshChain.On("NotifyBlocks").Run(func(mock.Arguments) {
 		replayed <- restored
 	}).Return(nil).Once()
-	freshChain.On("Notifications").Return((<-chan any)(nil)).Maybe()
+	freshChain.On("SubscribeChainEvents", mock.Anything).Unset()
+	freshChain.On("SubscribeChainEvents", mock.Anything).
+		Return(chain.EventSubscription{}).Once()
 
 	// Act: Fail public delivery, stop the owning Manager to drain the
 	// request loop and close storage, then reopen all durable Wallets.

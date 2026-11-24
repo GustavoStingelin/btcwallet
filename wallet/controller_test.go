@@ -376,7 +376,7 @@ func TestControllerChangePassphraseDrainsDuringManagerStop(t *testing.T) {
 					Return([]*walletData{}, nil).Once()
 
 				source := &bwmock.Chain{}
-				source.On("Notifications").Return((<-chan any)(nil)).Once()
+
 				manager := newManagerLifecycleTest(t, backend, source)
 
 				_, err := manager.Start(t.Context())
@@ -2222,7 +2222,6 @@ func TestControllerInfoSyncWorkerBackoff(t *testing.T) {
 		w, deps := createTestWalletWithMocks(t)
 		w.sync = newSyncer(
 			w.cfg, w.addrStore, w.txStore, w, w.store, w.id,
-			w.chainEventChan,
 		)
 		w.state = newWalletState(w.sync)
 
@@ -2305,8 +2304,9 @@ func TestControllerTargetedScanFailureKeepsWorker(t *testing.T) {
 		w, deps := createTestWalletWithMocks(t)
 		s := newSyncer(
 			w.cfg, w.addrStore, w.txStore, w, w.store, w.id,
-			w.chainEventChan,
 		)
+		events := make(chan any, 1)
+		s.bindChainEvents(events)
 		w.sync = s
 		w.state = newWalletState(s)
 
@@ -2386,7 +2386,7 @@ func TestControllerTargetedScanFailureKeepsWorker(t *testing.T) {
 
 		synctest.Wait()
 
-		w.chainEventChan <- chain.FilteredBlockConnected{Block: block}
+		events <- chain.FilteredBlockConnected{Block: block}
 
 		// Assert: Let the worker settle before cleanup verifies persistence
 		// and the single initialization through the mock expectations.

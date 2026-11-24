@@ -383,9 +383,6 @@ type Wallet struct {
 	// chain loop, scanning, and reorganization handling.
 	sync chainProcessor
 
-	// chainEventChan admits native observations to the sync worker.
-	chainEventChan chan any
-
 	// state maintains the wallet's atomic, three-dimensional status:
 	// Lifecycle (System), Synchronization (Chain), and Authentication
 	// (Security).

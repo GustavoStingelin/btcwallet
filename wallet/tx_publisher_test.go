@@ -2166,7 +2166,7 @@ func TestBroadcastReorgPublishFailureRetainsSpend(t *testing.T) {
 			})
 			require.NoError(t, err)
 			require.NoError(t, w.store.RollbackToBlock(
-				t.Context(), spendBlock.Height,
+				t.Context(), w.id, spendBlock.Height,
 			))
 
 			// Pin the unmined row and input claim before retrying;
@@ -2365,7 +2365,6 @@ func TestBroadcastDelayedReplyKeepsSyncerCandidate(t *testing.T) {
 
 	s := newSyncer(
 		w.cfg, w.addrStore, w.txStore, w, w.store, w.id,
-		w.chainEventChan,
 	)
 
 	// Act: Commit C through the actual notification path while B's reply is
@@ -2530,7 +2529,6 @@ func TestRebroadcastStaleSnapshotKeepsDeletedBranch(t *testing.T) {
 	)
 	s := newSyncer(
 		w.cfg, w.addrStore, w.txStore, w, snapshotStore, w.id,
-		w.chainEventChan,
 	)
 
 	// Act: Run the actual syncer retry against the captured, now stale rows.

@@ -41,10 +41,12 @@ func NewGenesisChain(tb testing.TB, current bool) *Chain {
 	tb.Helper()
 
 	params := &chaincfg.RegressionNetParams
+	idle := chain.EventSubscription{}
 	chain := &Chain{}
 
 	// Tests can replace these defaults when registration is under test.
 	chain.On("BackEnd").Return("mock").Maybe()
+	chain.On("SubscribeChainEvents", mock.Anything).Return(idle).Maybe()
 	chain.On("Notifications").Return((<-chan any)(nil)).Maybe()
 	chain.On("WatchAddrsFromTip", mock.Anything, mock.Anything).
 		Return(nil).Maybe()

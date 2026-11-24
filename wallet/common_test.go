@@ -332,7 +332,6 @@ func createTestWalletWithMocks(t *testing.T) (*Wallet, *mockWalletDeps) {
 	}
 	// Match managed assembly so every producer declares its routing interest.
 
-	w.chainEventChan = make(chan any, 1)
 	w.cache = newStoreRuntimeCache(mockStore)
 
 	// Stop the timer immediately to avoid leaks.

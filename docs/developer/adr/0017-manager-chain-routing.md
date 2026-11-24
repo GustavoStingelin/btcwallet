@@ -32,8 +32,8 @@ recovery.
 ### Constraints
 
 - The caller owns the chain client's lifetime.
-- Each Wallet receives events in source order and enrolls before installing
-  its watches.
+- Each Wallet enrolls before installing its watches. Its subscription
+  delivers retained events in source order, starting at enrollment.
 - KVDB keeps its isolated single-Wallet scope and background initialization.
   See [ADR 0015](0015-sql-shared-chain-ownership.md#36-lease-and-scope).
 
@@ -111,20 +111,17 @@ of duplicating block metadata. Each Wallet still needs local fork detection.
 ### Negative and Risks
 
 - Matching an event in more than one Wallet can repeat filtering work.
-- With bounded delivery at the shared chain client, a full Wallet mailbox can
-  delay later events for other Wallets.
+- A full subscription drops the new event for that Wallet. A mempool payment
+  missed this way may first become visible when the Wallet scans its block.
 - Wallet-owned history duplicates block metadata. Recovery of retained orphan
   observations above a canonical checkpoint remains a separate concern.
 
 ## 7. Implementation Overview
 
 The [SQL schema](0006-wtxmgr-sql-schema.md#24-implementation-overview)
-includes storage for Wallet-owned block history. Manager still coordinates
-shared rollback.
-
-Runtime adoption requires a separate ordered stream for each Wallet and a
-source-loss signal for Manager. Block references and rollback move to the
-owning Wallet together.
+keeps each Wallet's block history. Each Wallet consumes its own subscription
+and rewinds its own Store history on a disconnect. Manager publishes Wallets
+after startup and joins their workers before closing the Store.
 
 ## 8. References
 

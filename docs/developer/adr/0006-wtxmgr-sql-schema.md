@@ -130,8 +130,8 @@ transaction, all within a single SQL transaction.
 
 **Block identity**
 
-SQL has storage for Wallet-owned block history. Confirmation, birthday and
-checkpoint references still use shared blocks. See
+Confirmations, birthdays and checkpoints reference `wallet_blocks` by Wallet
+ID and block height. See
 [ADR 0017](0017-manager-chain-routing.md#3-decision) for the Wallet-owned design.
 
 **Transaction labels**
