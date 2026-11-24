@@ -10155,6 +10155,140 @@ func TestSyncerStartupReconcilesKVDBHistory(t *testing.T) {
 	require.Equal(t, replacement.Hash, newTx.Block.Hash)
 }
 
+// TestSyncerRestartPreservesReplacementReward verifies that a missing second
+// disconnect keeps a payment observed before backend readiness confirmed.
+func TestSyncerRestartPreservesReplacementReward(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: Commit the old branch and process only its tip disconnect.
+	// The next Wallet must recover from the remaining divergent checkpoint.
+	ctx := t.Context()
+	store, vault, id := newSQLScriptVault(t)
+
+	old := make([]db.Block, 4)
+	for i := range old {
+		old[i] = db.Block{
+			Height: uint32(i), Hash: chainhash.Hash{byte(i + 1)},
+			Timestamp: time.Unix(int64(i), 0).UTC(),
+		}
+	}
+
+	require.NoError(t, store.ApplyScanBatch(ctx, db.ScanBatchParams{
+		WalletID: id, SyncedBlocks: old,
+	}))
+
+	first := &bwmock.Chain{}
+	t.Cleanup(func() { first.AssertExpectations(t) })
+	first.On("IsCurrent").Return(true).Once()
+	first.On("GetBestBlock").Return(&old[2].Hash, int32(2), nil).Twice()
+	first.On("GetBlockHash", int64(2)).Return(&old[2].Hash, nil).Once()
+	first.On("GetBlockHeader", &old[2].Hash).
+		Return(&wire.BlockHeader{Timestamp: old[2].Timestamp}, nil).Once()
+	cfg := Config{
+		Name: "sql-watch-only-scripts", Chain: first,
+		ChainParams: &chainParams,
+	}
+	s := newTestSyncer(cfg, nil, nil, nil, store, id)
+	require.NoError(t, s.processChainEvent(ctx, chainEvent{
+		notification: chain.BlockDisconnected{
+			Block: wtxmgr.Block{Height: 3, Hash: old[3].Hash},
+		},
+	}))
+
+	// Buffer the replacement payment during restart. Once its source is
+	// current the reward is mature, and its unmined spend is published.
+	const height = recoveryBatchSize + 3
+
+	hashes, headers := linkedDisconnectHeaders(old[1].Hash, height-1, 2)
+	source := &bwmock.Chain{}
+	t.Cleanup(func() { source.AssertExpectations(t) })
+
+	cfg.Chain = source
+	restarted := newTestSyncer(cfg, nil, nil, nil, store, id)
+	// The worker resolves native records against this Wallet's owned
+	// scripts. Pay the reward to a persisted imported destination.
+	vector := sqlScriptVectors(t)[0]
+	importSQLScript(t, store, vault, id, vector.addrType,
+		vector.scriptPubKey, nil)
+	addr, err := restarted.watchAddress(vector.scriptPubKey)
+	require.NoError(t, err)
+	coinbase := reorgCoinbase(t, 7)
+	coinbase.MsgTx.TxOut[0].PkScript = vector.scriptPubKey
+	reward, err := wtxmgr.NewTxRecordFromMsgTx(
+		&coinbase.MsgTx, coinbase.Received,
+	)
+	require.NoError(t, err)
+	spend := reorgSpend(t, reward, 800)
+	events := make(chan any, 1)
+
+	restarted.events = events
+	events <- chain.FilteredBlockConnected{
+		RelevantTxs: []*wtxmgr.TxRecord{reward},
+		Block: &wtxmgr.BlockMeta{
+			Block: wtxmgr.Block{Height: 3, Hash: hashes[1]},
+			Time:  headers[1].Timestamp,
+		},
+	}
+
+	source.On("IsCurrent").Return(false).Once()
+	source.On("IsCurrent").Run(func(mock.Arguments) {
+		tx, err := store.GetTx(ctx, db.GetTxQuery{
+			WalletID: id, Txid: reward.Hash,
+		})
+		require.NoError(t, err)
+		require.NotNil(t, tx.Block)
+		require.Equal(t, hashes[1], tx.Block.Hash)
+		require.NoError(t, store.CreateTx(ctx, db.CreateTxParams{
+			WalletID: id, Tx: &spend.MsgTx,
+			Status: db.TxStatusPublished, Received: spend.Received,
+		}))
+	}).Return(true).Once()
+	source.On("GetBestBlock").
+		Return(&hashes[len(hashes)-1], int32(height), nil).Twice()
+	source.On("GetBlockHashes", int64(0), int64(2)).
+		Return([]chainhash.Hash{
+			old[0].Hash, old[1].Hash, hashes[0],
+		}, nil).Once()
+	source.On("GetBlockHeader", &old[1].Hash).
+		Return(&wire.BlockHeader{Timestamp: old[1].Timestamp}, nil).Once()
+	source.On("GetBlockHashes", int64(4), int64(height)).
+		Return(hashes[2:], nil).Once()
+	source.On("GetBlockHeaders", hashes[2:]).Return(headers[2:], nil).Once()
+	source.On("GetBlockHashes", int64(2), int64(3)).
+		Return(hashes[:2], nil).Once()
+	source.On("GetBlockHeaders", hashes[:2]).Return(headers[:2], nil).Once()
+	source.On("WatchAddrsFromTip", mock.Anything, []address.Address{addr}).
+		Return(nil).Once()
+	// The observed reward now has an owned credit, so watch its outpoint.
+	point := wire.OutPoint{Hash: reward.Hash}
+	source.On("NotifySpent", []*wire.OutPoint{&point}).Return(nil).Once()
+	source.On("NotifyBlocks").Return(nil).Once()
+
+	// Act: Start with the old checkpoint and a payment on the new branch.
+	// The two header batches link across their seam above the common fork.
+	err = restarted.initChainSync(ctx)
+
+	// Assert: Progress returns to the fork for scanning replacement blocks.
+	// Rejecting a valid seam would prevent startup; an indiscriminate
+	// height rewind would invalidate the published spend of the reward.
+	require.NoError(t, err)
+	info, err := store.GetWallet(ctx, cfg.Name)
+	require.NoError(t, err)
+	require.Equal(t, old[1].Hash, info.SyncedTo.Hash)
+	tx, err := store.GetTx(ctx, db.GetTxQuery{
+		WalletID: id, Txid: reward.Hash,
+	})
+	require.NoError(t, err)
+	require.Equal(t, db.TxStatusPublished, tx.Status)
+	require.NotNil(t, tx.Block)
+	require.Equal(t, hashes[1], tx.Block.Hash)
+	tx, err = store.GetTx(ctx, db.GetTxQuery{
+		WalletID: id, Txid: spend.Hash,
+	})
+	require.NoError(t, err)
+	require.Equal(t, db.TxStatusPublished, tx.Status)
+}
+
 // TestSyncerCollectsDisconnectEvidence verifies the proof covers this Wallet's
 // committed blocks and mined payments across two native header batches.
 func TestSyncerCollectsDisconnectEvidence(t *testing.T) {
