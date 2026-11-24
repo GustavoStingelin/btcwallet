@@ -1099,22 +1099,36 @@ func TestControllerStop(t *testing.T) {
 	require.ErrorIs(t, err, ErrWalletStopped)
 }
 
-// TestControllerStopBeforeStart verifies that stop makes an Initialized
-// Wallet terminal without attempting to cancel workers that do not exist.
+// TestControllerStopBeforeStart verifies that disposal releases an enrolled
+// candidate and makes it terminal even if admission never starts its workers.
 func TestControllerStopBeforeStart(t *testing.T) {
 	t.Parallel()
 
-	// Arrange: Create a Wallet whose maintained runtime has never started,
-	// so no startup dependency or background-worker expectation is needed.
+	// Arrange a private Wallet with a real syncer and strict borrowed
+	// source. Couple enrollment to this Wallet's own lifetime.
 	w, _ := createTestWalletWithMocks(t)
+	source := &bwmock.Chain{}
+	t.Cleanup(func() { source.AssertExpectations(t) })
 
-	// Act: Stop the fresh Wallet and then attempt its first Start.
+	w.cfg.Chain = source
+	processor := newTestSyncer(w.cfg, nil, nil, nil, w.store, w.id)
+	w.sync = processor
+	events := make(chan any)
+	sub := chain.EventSubscription{Events: events, Done: w.lifetimeCtx.Done()}
+	source.On("SubscribeChainEvents", w.lifetimeCtx).Return(sub).Once()
+	done, err := w.enrollChainEvents()
+	require.NoError(t, err)
+
+	// Act as Manager would if another private candidate failed startup.
 	stopErr := w.stop()
 	startErr := w.start(t.Context())
 
-	// Assert: Stop succeeds directly and permanently prevents the retained
-	// Wallet instance from starting later.
+	// Assert the worker received this stream, enrollment observed the
+	// candidate's cancellation and its retained pointer cannot restart it.
 	require.NoError(t, stopErr)
+	require.Equal(t, sub.Events, processor.events)
+	require.Equal(t, sub.Done, done)
+	require.ErrorIs(t, w.lifetimeCtx.Err(), context.Canceled)
 	require.ErrorIs(t, startErr, ErrWalletStopped)
 }
 

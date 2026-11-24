@@ -236,6 +236,9 @@ type prepareRollbackReq struct {
 // chainProcessor abstracts Wallet event processing and recovery, allowing
 // Wallet and controller tests to replace the existing worker.
 type chainProcessor interface {
+	// bindChainEvents connects the native stream before the worker starts.
+	bindChainEvents(events <-chan any)
+
 	// run executes the main synchronization loop.
 	run(ctx context.Context) error
 
@@ -310,6 +313,12 @@ type syncer struct {
 
 // A compile-time assertion to ensure that syncer implements chainProcessor.
 var _ chainProcessor = (*syncer)(nil)
+
+// bindChainEvents installs the Wallet's subscription while the candidate is
+// private. Starting the worker publishes this read end to its sole consumer.
+func (s *syncer) bindChainEvents(events <-chan any) {
+	s.events = events
+}
 
 // refreshLiveWatches registers stored addresses and outpoints for transaction
 // notifications. The Store selects the addresses and outputs to watch.

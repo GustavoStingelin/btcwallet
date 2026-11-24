@@ -118,6 +118,11 @@ type mockChainProcessor struct {
 // chainProcessor interface.
 var _ chainProcessor = (*mockChainProcessor)(nil)
 
+// bindChainEvents records the stream handed to the worker during admission.
+func (m *mockChainProcessor) bindChainEvents(events <-chan any) {
+	m.Called(events)
+}
+
 // run implements the chainProcessor interface.
 func (m *mockChainProcessor) run(ctx context.Context) error {
 	args := m.Called(ctx)

@@ -3458,9 +3458,11 @@ func TestManagerChainEventOrder(t *testing.T) {
 	// Three headers expose the capacity-one bound without extra worker queues.
 	notifications := make(chan any, 3)
 
+	ctx, cancel := context.WithCancel(t.Context())
 	w := &Wallet{
 		id:             1,
-		lifetimeCtx:    t.Context(),
+		lifetimeCtx:    ctx,
+		cancel:         cancel,
 		chainEventChan: make(chan chainEvent, 1),
 	}
 

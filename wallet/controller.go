@@ -167,6 +167,21 @@ type Controller interface {
 		targets []waddrmgr.AccountScope) error
 }
 
+// enrollChainEvents gives this candidate its own stream before native watch
+// activation. Manager observes its completion without competing for events.
+func (w *Wallet) enrollChainEvents() (<-chan struct{}, error) {
+	sub := w.cfg.Chain.SubscribeChainEvents(w.lifetimeCtx)
+	select {
+	case <-sub.Done:
+		// A stopped source cannot deliver the candidate's first payment.
+		return nil, ErrWalletShuttingDown
+	default:
+		w.sync.bindChainEvents(sub.Events)
+
+		return sub.Done, nil
+	}
+}
+
 // start prepares runtime data and starts the Wallet's existing workers using
 // its construction lifetime. Setup failure leaves the instance terminal;
 // Manager publishes the candidate only after this method succeeds.
@@ -391,10 +406,11 @@ func (w *Wallet) pauseForRollback(ctx context.Context,
 // Manager serializes lifecycle operations, so this method never runs alongside
 // start or another stop and needs no additional synchronization primitive.
 func (w *Wallet) stop() error {
-	// A Wallet stopped before its first Start has no workers to cancel or
-	// join, but it must still become terminal so a retained pointer cannot
-	// start a new runtime later.
+	// Admission may already have enrolled this candidate before another
+	// candidate failed. Release its subscription even without a worker.
 	if lifecycle(w.state.lifecycle.Load()) == lifecycleInitialized {
+		w.cancel()
+
 		return w.state.toStopped()
 	}
 
