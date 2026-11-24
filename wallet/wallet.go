@@ -386,7 +386,7 @@ type Wallet struct {
 	// chainSyncer is the Manager's required routing owner for every backend.
 	// The Wallet and its processor share it and the bounded event inbox.
 	chainSyncer    chainRouter
-	chainEventChan chan chainEvent
+	chainEventChan chan any
 
 	// state maintains the wallet's atomic, three-dimensional status:
 	// Lifecycle (System), Synchronization (Chain), and Authentication

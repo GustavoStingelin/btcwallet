@@ -2213,7 +2213,7 @@ func newSQLAddressSigningWallet(t *testing.T) (*Wallet, *bwmock.Chain,
 	// Supply the same routing dependency as Manager assembly before address
 	// or import calls can activate native notifications on this fixture.
 	w.chainSyncer = newChainSyncer(chain, &chainParams)
-	w.chainEventChan = make(chan chainEvent, 1)
+	w.chainEventChan = make(chan any, 1)
 
 	// Disable auto-lock timing so this fixture exercises only its API call.
 	w.lockTimer.Stop()
@@ -3444,7 +3444,7 @@ func startSQLScriptWallet(t *testing.T, store db.Store,
 	// Supply the same routing dependency as Manager assembly before address
 	// or import calls can activate native notifications on this fixture.
 	w.chainSyncer = newChainSyncer(chain, &chainParams)
-	w.chainEventChan = make(chan chainEvent, 1)
+	w.chainEventChan = make(chan any, 1)
 
 	// Disable auto-lock timing so this fixture exercises only its API call.
 	w.lockTimer.Stop()

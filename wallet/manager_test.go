@@ -184,8 +184,8 @@ func TestManagerChainRollbackOrder(t *testing.T) {
 		m := newManagerLifecycleTest(t, backend, source)
 		m.started.Store(true)
 		m.wallets[first.cfg.Name], m.wallets[second.cfg.Name] = first, second
-		firstEvents := make(chan chainEvent, 1)
-		secondEvents := make(chan chainEvent, 1)
+		firstEvents := make(chan any, 1)
+		secondEvents := make(chan any, 1)
 		first.chainEventChan, second.chainEventChan = firstEvents, secondEvents
 		event := chain.FilteredBlockConnected{
 			Block: &wtxmgr.BlockMeta{Block: wtxmgr.Block{Height: 8}},
@@ -200,8 +200,8 @@ func TestManagerChainRollbackOrder(t *testing.T) {
 		// Act: One source caller accepts the prior event before rollback;
 		// each simulated worker acknowledges only after that event is read.
 		require.NoError(t, m.dispatchChainEvent(t.Context(), event))
-		require.Equal(t, event, (<-firstEvents).notification)
-		require.Equal(t, event, (<-secondEvents).notification)
+		require.Equal(t, event, (<-firstEvents))
+		require.Equal(t, event, (<-secondEvents))
 
 		rolled := make(chan error, 1)
 		go func() {
@@ -212,13 +212,13 @@ func TestManagerChainRollbackOrder(t *testing.T) {
 		}()
 
 		for range 2 {
-			var raw chainEvent
+			var raw any
 			select {
 			case raw = <-firstEvents:
 			case raw = <-secondEvents:
 			}
 
-			req, ok := raw.notification.(prepareRollbackReq)
+			req, ok := raw.(prepareRollbackReq)
 			require.True(t, ok)
 			synctest.Wait()
 			require.Empty(t, persisted)
@@ -231,8 +231,8 @@ func TestManagerChainRollbackOrder(t *testing.T) {
 		require.NoError(t, <-rolled)
 		require.True(t, m.started.Load())
 		require.NoError(t, m.dispatchChainEvent(t.Context(), event))
-		require.Equal(t, event, (<-firstEvents).notification)
-		require.Equal(t, event, (<-secondEvents).notification)
+		require.Equal(t, event, (<-firstEvents))
+		require.Equal(t, event, (<-secondEvents))
 	})
 }
 
@@ -288,7 +288,7 @@ func TestManagerChainRollbackStopsOnError(t *testing.T) {
 			require.NoError(t, err)
 
 			m.wallets[w.cfg.Name] = w
-			events := make(chan chainEvent, 1)
+			events := make(chan any, 1)
 			w.chainEventChan = events
 			processor := newSyncer(
 				w.cfg, w.addrStore, w.txStore, w, w.store, w.id,
@@ -305,7 +305,7 @@ func TestManagerChainRollbackStopsOnError(t *testing.T) {
 
 			raw := <-events
 
-			req, ok := raw.notification.(prepareRollbackReq)
+			req, ok := raw.(prepareRollbackReq)
 			require.True(t, ok)
 
 			w.wg.Add(1)
@@ -313,7 +313,7 @@ func TestManagerChainRollbackStopsOnError(t *testing.T) {
 			go func() {
 				defer w.wg.Done()
 
-				processed <- processor.processChainEvent(w.lifetimeCtx, raw)
+				processed <- processor.applyBeforeSync(w.lifetimeCtx, raw)
 			}()
 
 			// Assert: Cleanup begins without an external Stop rescuing it.
@@ -462,7 +462,7 @@ func TestManagerChainRollbackCreate(t *testing.T) {
 
 	m.wallets[w.cfg.Name] = w
 
-	events := make(chan chainEvent, 1)
+	events := make(chan any, 1)
 	w.chainEventChan = events
 
 	entered, release := make(chan struct{}), make(chan struct{})
@@ -513,7 +513,7 @@ func TestManagerChainRollbackCreate(t *testing.T) {
 		Block: wtxmgr.Block{Height: 8},
 	}
 
-	req, ok := (<-events).notification.(prepareRollbackReq)
+	req, ok := (<-events).(prepareRollbackReq)
 	require.True(t, ok)
 
 	close(req.readyForRollback)
@@ -588,7 +588,7 @@ func TestManagerChainRollbackStop(t *testing.T) {
 			require.NoError(t, err)
 
 			m.wallets[w.cfg.Name] = w
-			events := make(chan chainEvent, 1)
+			events := make(chan any, 1)
 			w.chainEventChan = events
 			entered, release := make(chan struct{}), make(chan struct{})
 			rolledBack := make(chan struct{})
@@ -640,7 +640,7 @@ func TestManagerChainRollbackStop(t *testing.T) {
 				Block: wtxmgr.Block{Height: 8},
 			}
 
-			req, ok := (<-events).notification.(prepareRollbackReq)
+			req, ok := (<-events).(prepareRollbackReq)
 			require.True(t, ok)
 			close(req.readyForRollback)
 			<-entered
@@ -713,7 +713,7 @@ func TestManagerChainRollbackStopDuringPreparation(t *testing.T) {
 				require.NoError(t, err)
 
 				m.wallets[w.cfg.Name] = w
-				w.chainEventChan = make(chan chainEvent, test.capacity)
+				w.chainEventChan = make(chan any, test.capacity)
 
 				notifications <- chain.BlockDisconnected{
 					Block: wtxmgr.Block{Height: 8},
@@ -3463,7 +3463,7 @@ func TestManagerChainEventOrder(t *testing.T) {
 		id:             1,
 		lifetimeCtx:    ctx,
 		cancel:         cancel,
-		chainEventChan: make(chan chainEvent, 1),
+		chainEventChan: make(chan any, 1),
 	}
 
 	// Reuse owned cleanup so the same source fixture remains valid when the
@@ -3502,7 +3502,7 @@ func TestManagerChainEventOrder(t *testing.T) {
 	for height := int32(1); height <= 3; height++ {
 		select {
 		case event := <-w.chainEventChan:
-			header, ok := event.notification.(chain.BlockConnected)
+			header, ok := event.(chain.BlockConnected)
 			require.True(t, ok)
 			require.Equal(t, height, header.Height)
 		case <-time.After(time.Second):
@@ -3520,12 +3520,12 @@ func TestManagerChainEventMembership(t *testing.T) {
 	first := &Wallet{
 		id:             1,
 		lifetimeCtx:    t.Context(),
-		chainEventChan: make(chan chainEvent, 1),
+		chainEventChan: make(chan any, 1),
 	}
 	second := &Wallet{
 		id:             2,
 		lifetimeCtx:    t.Context(),
-		chainEventChan: make(chan chainEvent, 1),
+		chainEventChan: make(chan any, 1),
 	}
 
 	manager := &Manager{
@@ -3550,10 +3550,10 @@ func TestManagerChainEventMembership(t *testing.T) {
 
 	// Assert: Both current members receive the next control event unchanged.
 	require.IsType(
-		t, chain.ClientConnected{}, (<-first.chainEventChan).notification,
+		t, chain.ClientConnected{}, (<-first.chainEventChan),
 	)
 	require.IsType(
-		t, chain.ClientConnected{}, (<-second.chainEventChan).notification,
+		t, chain.ClientConnected{}, (<-second.chainEventChan),
 	)
 }
 

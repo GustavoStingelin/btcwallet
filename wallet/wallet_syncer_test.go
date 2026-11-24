@@ -64,7 +64,7 @@ func newTestSyncer(cfg Config, addrStore waddrmgr.AddrStore,
 
 	return newSyncer(
 		cfg, addrStore, txStore, manager, store, walletID,
-		newChainSyncer(cfg.Chain, params), make(chan chainEvent, 1),
+		newChainSyncer(cfg.Chain, params), make(chan any, 1),
 	)
 }
 
@@ -194,13 +194,13 @@ func TestSyncerRollbackRejectsStaleBatch(t *testing.T) {
 		rollbackDone := make(chan struct{})
 
 		readyForRollback := make(chan struct{})
-		events := make(chan chainEvent, 1)
-		s.chainEventChan = events
+		events := make(chan any, 1)
+		s.events = events
 
-		events <- chainEvent{notification: prepareRollbackReq{
+		events <- prepareRollbackReq{
 			readyForRollback: readyForRollback,
 			rollbackDone:     rollbackDone,
-		}}
+		}
 
 		store.On("RollbackToBlock", mock.Anything, uint32(100)).
 			Return(nil).Once()
@@ -239,8 +239,8 @@ func TestSyncerRollbackTargetedBatch(t *testing.T) {
 		s := newTestSyncer(Config{
 			Chain: backend, ChainParams: &chainParams,
 		}, nil, nil, nil, store, 7)
-		events := make(chan chainEvent, 1)
-		s.chainEventChan = events
+		events := make(chan any, 1)
+		s.events = events
 
 		store.On("ListAccounts", mock.Anything, mock.Anything).
 			Return([]db.AccountInfo(nil), nil).Times(4)
@@ -300,10 +300,10 @@ func TestSyncerRollbackTargetedBatch(t *testing.T) {
 		rollbackDone := make(chan struct{})
 		readyForRollback := make(chan struct{})
 
-		events <- chainEvent{notification: prepareRollbackReq{
+		events <- prepareRollbackReq{
 			readyForRollback: readyForRollback,
 			rollbackDone:     rollbackDone,
-		}}
+		}
 
 		close(release)
 		<-readyForRollback
@@ -373,8 +373,8 @@ func TestSyncerRollbackRetainedPayment(t *testing.T) {
 	require.NoError(t, second.AddTransaction(payment))
 
 	hash := second.BlockHash()
-	events := make(chan chainEvent, 1)
-	s.chainEventChan = events
+	events := make(chan any, 1)
+	s.events = events
 
 	client.On("GetBestBlock").Unset()
 	client.On("GetBestBlock").Return(&hash, int32(2), nil).Once()
@@ -386,12 +386,12 @@ func TestSyncerRollbackRetainedPayment(t *testing.T) {
 	// Act: Commit the fetched first block while the next filtered block is
 	// retained by rollback polling. Replay must leave that next height for
 	// historical recovery, even though the live event contains no matches.
-	events <- chainEvent{notification: chain.FilteredBlockConnected{
+	events <- chain.FilteredBlockConnected{
 		Block: &wtxmgr.BlockMeta{
 			Block: wtxmgr.Block{Height: 2, Hash: hash},
 			Time:  second.Header.Timestamp,
 		},
-	}}
+	}
 
 	err = s.putSyncBatch(t.Context(), state, []scanResult{
 		{
@@ -440,8 +440,8 @@ func TestSyncerRollbackRetainedRequestFailure(t *testing.T) {
 	store := &walletmock.Store{}
 	publisher := &mockTxPublisher{}
 	s := newTestSyncer(Config{}, nil, nil, publisher, store, 7)
-	events := make(chan chainEvent, 1)
-	s.chainEventChan = events
+	events := make(chan any, 1)
+	s.events = events
 	state := NewRecoveryState(0, &chainParams, nil)
 	batchCall := store.On("ApplyScanBatch", mock.Anything,
 		mock.Anything).Return(errDBMock).Once()
@@ -454,11 +454,11 @@ func TestSyncerRollbackRetainedRequestFailure(t *testing.T) {
 		publisher.AssertExpectations(t)
 	})
 
-	events <- chainEvent{notification: chain.FilteredBlockConnected{
+	events <- chain.FilteredBlockConnected{
 		Block: &wtxmgr.BlockMeta{
 			Block: wtxmgr.Block{Height: 1},
 		},
-	}}
+	}
 
 	// Act: The pre-commit check retains the queued event. Its deferred
 	// handler must still run after the historical Store call fails.
@@ -492,8 +492,8 @@ func TestSyncerRollbackTargetedEventFailure(t *testing.T) {
 	}, nil, nil, publisher, store, 7)
 	s.state.Store(uint32(syncStateSynced))
 
-	events := make(chan chainEvent, 1)
-	s.chainEventChan = events
+	events := make(chan any, 1)
+	s.events = events
 
 	store.On("ListAccounts", mock.Anything, mock.Anything).
 		Return([]db.AccountInfo(nil), nil).Twice()
@@ -517,9 +517,9 @@ func TestSyncerRollbackTargetedEventFailure(t *testing.T) {
 	backend.On("GetBlockHeaders", hashes).Run(func(mock.Arguments) {
 		// Use a prepared progress event so Store failure exercises the
 		// retained handler without reintroducing Wallet-side matching.
-		events <- chainEvent{notification: chain.FilteredBlockConnected{
+		events <- chain.FilteredBlockConnected{
 			Block: &wtxmgr.BlockMeta{Block: wtxmgr.Block{Height: 1}},
-		}}
+		}
 	}).Return(headers, nil).Once()
 	batchCall := store.On("ApplyScanBatch", mock.Anything, mock.Anything).
 		Return(nil).Once()
@@ -741,8 +741,8 @@ func TestSyncerRollbackDuringBackendSync(t *testing.T) {
 		client.On("GetBlocks", []chainhash.Hash{hash}).
 			Return([]*wire.MsgBlock{block}, nil).Once()
 
-		events := make(chan chainEvent, 1)
-		s.chainEventChan = events
+		events := make(chan any, 1)
+		s.events = events
 		ready, done := make(chan struct{}), make(chan struct{})
 		initialized := make(chan error, 1)
 		workerDone := make(chan struct{})
@@ -763,17 +763,17 @@ func TestSyncerRollbackDuringBackendSync(t *testing.T) {
 			initialized <- s.initChainSync(ctx)
 		}()
 
-		events <- chainEvent{notification: chain.FilteredBlockConnected{
+		events <- chain.FilteredBlockConnected{
 			Block: &wtxmgr.BlockMeta{
 				Block: wtxmgr.Block{Height: 1, Hash: hash},
 				Time:  block.Header.Timestamp,
 			},
-		}}
+		}
 
-		events <- chainEvent{notification: prepareRollbackReq{
+		events <- prepareRollbackReq{
 			readyForRollback: ready,
 			rollbackDone:     done,
-		}}
+		}
 
 		<-ready
 
@@ -2028,19 +2028,21 @@ func TestProcessRelevantTxUsesStore(t *testing.T) {
 	rec, err := wtxmgr.NewTxRecordFromMsgTx(tx, received)
 	require.NoError(t, err)
 
-	mailbox := make(chan chainEvent, 1)
+	// Native delivery resolves the receiving script before writing.
+	store.On("ResolveOwnedAddresses", mock.Anything,
+		matchResolveOwnedAddressesQuery(walletID, tx.TxOut[0].PkScript)).
+		Return(ownedAddrsResult(tx.TxOut[0].PkScript), nil).Once()
 
-	s.chainEventChan = mailbox
-	mailbox <- chainEvent{
-		notification: chain.RelevantTx{TxRecord: rec},
-		matches:      liveMatches(rec),
-	}
+	mailbox := make(chan any, 1)
+
+	s.events = mailbox
+	mailbox <- chain.RelevantTx{TxRecord: rec}
 
 	store.On("ApplyTxBatch", mock.Anything,
 		matchUnminedTxBatch(walletID, tx, addr, received),
 	).Return(nil).Once()
 
-	// Act: Consume an unconfirmed Manager-prepared notification through the
+	// Act: Consume an unconfirmed native notification through the
 	// SQL processor mailbox, with no raw source dependency.
 	err = s.waitForEvent(t.Context())
 
@@ -2596,18 +2598,20 @@ func TestProcessFilteredBlockUsesStore(t *testing.T) {
 		matchBlockTxBatch(walletID, tx, addr, received, block),
 	).Return(nil).Once()
 
-	mailbox := make(chan chainEvent, 1)
+	// Native delivery resolves the receiving script before writing.
+	store.On("ResolveOwnedAddresses", mock.Anything,
+		matchResolveOwnedAddressesQuery(walletID, tx.TxOut[0].PkScript)).
+		Return(ownedAddrsResult(tx.TxOut[0].PkScript), nil).Times(3)
 
-	s.chainEventChan = mailbox
-	mailbox <- chainEvent{
-		notification: chain.FilteredBlockConnected{
-			Block:       block,
-			RelevantTxs: []*wtxmgr.TxRecord{rec},
-		},
-		matches: liveMatches(rec),
+	mailbox := make(chan any, 1)
+
+	s.events = mailbox
+	mailbox <- chain.FilteredBlockConnected{
+		Block:       block,
+		RelevantTxs: []*wtxmgr.TxRecord{rec},
 	}
 
-	// Act: Apply a Manager-prepared filtered block on the existing worker's
+	// Act: Apply a native filtered block on the existing worker's
 	// mailbox path, preserving its atomic transaction/checkpoint boundary.
 	err = s.waitForEvent(t.Context())
 
@@ -2631,9 +2635,8 @@ func TestProcessFilteredBlockUsesStore(t *testing.T) {
 
 	// Act: Deliver the second representation through the same mailbox after
 	// its block has become the committed tip.
-	mailbox <- chainEvent{
-		notification: chain.FilteredBlockConnected{Block: block},
-		matches:      liveMatches(late),
+	mailbox <- chain.FilteredBlockConnected{
+		Block: block, RelevantTxs: []*wtxmgr.TxRecord{late},
 	}
 
 	err = s.waitForEvent(t.Context())
@@ -2667,9 +2670,8 @@ func TestProcessFilteredBlockUsesStore(t *testing.T) {
 
 	// Act: Deliver the older representation after the mocked catch-up; the
 	// worker must resolve its identity from recorded history instead of tip102.
-	mailbox <- chainEvent{
-		notification: chain.FilteredBlockConnected{Block: block},
-		matches:      liveMatches(historical),
+	mailbox <- chain.FilteredBlockConnected{
+		Block: block, RelevantTxs: []*wtxmgr.TxRecord{historical},
 	}
 
 	err = s.waitForEvent(t.Context())
@@ -4947,11 +4949,11 @@ func TestWaitForEvent(t *testing.T) {
 	)
 
 	// Mock chain notifications channel.
-	notificationChan := make(chan chainEvent, 1)
-	s.chainEventChan = notificationChan
+	notificationChan := make(chan any, 1)
+	s.events = notificationChan
 
 	// Case 1: Test event handling when a chain notification arrives.
-	notificationChan <- chainEvent{notification: chain.BlockConnected{}}
+	notificationChan <- chain.BlockConnected{}
 
 	// Act & Assert: Call waitForEvent and verify it correctly processes
 	// the arriving notification.
@@ -7166,12 +7168,10 @@ func TestRunSyncStep_Success(t *testing.T) {
 	store.On("ListTxns", mock.Anything, mock.Anything).Return(
 		[]db.TxInfo{}, nil).Once()
 
-	notifChan := make(chan chainEvent, 1)
-	s.chainEventChan = notifChan
+	notifChan := make(chan any, 1)
+	s.events = notifChan
 
-	notifChan <- chainEvent{
-		notification: chain.BlockConnected{Block: wtxmgr.Block{Height: 101}},
-	}
+	notifChan <- chain.BlockConnected{Block: wtxmgr.Block{Height: 101}}
 
 	// Act: Execute a sync step.
 	err := s.runSyncStep(t.Context())

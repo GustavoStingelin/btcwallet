@@ -325,7 +325,7 @@ func setupBenchmarkWallet(tb testing.TB,
 	}
 
 	w.chainSyncer = newChainSyncer(w.cfg.Chain, w.cfg.ChainParams)
-	w.chainEventChan = make(chan chainEvent, 1)
+	w.chainEventChan = make(chan any, 1)
 
 	if w.sync == nil {
 		w.sync = newSyncer(

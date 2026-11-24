@@ -529,20 +529,13 @@ func (m *Manager) dispatchChainEvent(ctx context.Context, n any) error {
 
 	wallets := m.chainRecipients()
 
-	events := m.chainSyncer.routeChainEvent(n, wallets)
-	log.Debugf("Routing chain event %T to %d Wallets", n, len(events))
-
+	// Each Wallet resolves this payment against its own durable history.
 	for _, w := range wallets {
-		event, relevant := events[w.id]
-		if !relevant {
-			continue
-		}
-
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-w.lifetimeCtx.Done():
-		case w.chainEventChan <- event:
+		case w.chainEventChan <- n:
 		}
 	}
 

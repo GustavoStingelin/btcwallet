@@ -37,7 +37,7 @@ func newManagedWallet(cfg Config, data *walletData,
 	// Allocate routing admission before the Wallet can be published. Its
 	// existing sync worker remains the sole event processor.
 	w.chainSyncer = syncer
-	w.chainEventChan = make(chan chainEvent, 1)
+	w.chainEventChan = make(chan any, 1)
 
 	processor := newSyncer(
 		cfg, w.addrStore, w.txStore, w, w.store, w.id,
