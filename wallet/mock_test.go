@@ -184,3 +184,21 @@ func (m *mockTxPublisher) rebroadcast(ctx context.Context,
 	args := m.Called(ctx, tx)
 	return args.Error(0)
 }
+
+// syncRetryStoreMock leaves history persistence on SQLite and intercepts only
+// the empty transaction reads needed to stop the worker at its idle boundary.
+type syncRetryStoreMock struct {
+	db.Store
+	mock.Mock
+}
+
+var _ db.Store = (*syncRetryStoreMock)(nil)
+
+// ListTxns exposes the fixture's empty graph through explicit expectations so
+// cancellation occurs at idle without timers or an additional worker.
+func (m *syncRetryStoreMock) ListTxns(ctx context.Context,
+	query db.ListTxnsQuery) ([]db.TxInfo, error) {
+
+	args := m.Called(ctx, query)
+	return args.Get(0).([]db.TxInfo), args.Error(1)
+}
