@@ -1000,6 +1000,122 @@ func (s *syncer) blockMatchesCheckpoint(ctx context.Context, block db.Block,
 	return block.Hash == committedHash, nil
 }
 
+// matchLiveTransactions selects this Wallet's payments from the shared
+// client's native records. A block may spend its own earlier payments before
+// the Store has recorded them. Only this call needs those outpoints.
+func (s *syncer) matchLiveTransactions(ctx context.Context,
+	records []*wtxmgr.TxRecord) (TxEntries, error) {
+
+	var matches TxEntries
+
+	received := make(map[wire.OutPoint]struct{})
+
+	for _, rec := range records {
+		// Resolve receiving scripts using the same ownership rules as
+		// publication, including individual members of multisig outputs.
+		tx := &rec.MsgTx
+		outputs := extractTxAddrs(tx, s.cfg.ChainParams)
+
+		owned, err := filterOwnedAddresses(
+			ctx, s.store, s.walletID, outputs,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("resolve live outputs: %w", err)
+		}
+
+		match := TxEntry{Rec: rec}
+		for i := range tx.TxOut {
+			//nolint:gosec // The wire format bounds the output index.
+			index := uint32(i)
+			for _, addr := range outputs[index] {
+				// P2PK and P2PKH can encode the same address.
+				script, err := txscript.PayToAddrScript(addr)
+				if err != nil {
+					return nil, err
+				}
+
+				if _, ok := owned[string(script)]; !ok {
+					continue
+				}
+
+				match.Entries = append(match.Entries, AddrEntry{
+					Address: addr,
+					Credit:  wtxmgr.CreditEntry{Index: index},
+				})
+				received[wire.OutPoint{
+					Hash: rec.Hash, Index: index,
+				}] = struct{}{}
+			}
+		}
+
+		if len(match.Entries) != 0 {
+			matches = append(matches, match)
+			continue
+		}
+
+		// An input-only spend can consume an earlier payment from this
+		// batch even before that payment is visible to Store queries.
+		spendsOwned, err := s.matchesLiveSpend(ctx, tx, received)
+		if err != nil {
+			return nil, err
+		}
+
+		if spendsOwned {
+			matches = append(matches, match)
+		}
+	}
+
+	return matches, nil
+}
+
+// matchesLiveSpend checks inputs against earlier outputs in this batch, then
+// against stored credits, including outputs already spent by a conflict.
+func (s *syncer) matchesLiveSpend(ctx context.Context, tx *wire.MsgTx,
+	received map[wire.OutPoint]struct{}) (bool, error) {
+
+	var scripts [][]byte
+	for _, in := range tx.TxIn {
+		if _, ok := received[in.PreviousOutPoint]; ok {
+			return true, nil
+		}
+
+		script, err := txscript.ComputePkScript(
+			in.SignatureScript, in.Witness,
+		)
+		if err == nil {
+			scripts = append(scripts, script.Script())
+		}
+	}
+
+	spent, err := spendsWalletOutput(ctx, s.store, s.walletID, tx)
+	if err != nil {
+		return false, fmt.Errorf("resolve live spend: %w", err)
+	}
+
+	if spent || len(scripts) == 0 {
+		return spent, nil
+	}
+
+	// An input's script can identify a watched spend before the funding
+	// transaction is scanned. It does not establish an output credit.
+	inputs, err := s.store.ResolveOwnedAddresses(
+		ctx, db.ResolveOwnedAddressesQuery{
+			WalletID: s.walletID, ScriptPubKeys: scripts,
+		},
+	)
+	if err != nil {
+		return false, fmt.Errorf("resolve live inputs: %w", err)
+	}
+
+	for _, info := range inputs {
+		if !info.NoChainSync {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
 // applyStoreTxBatch writes transaction matches through the store batch API.
 func (s *syncer) applyStoreTxBatch(ctx context.Context,
 	matches TxEntries, block *db.Block, syncedTo *db.Block) error {

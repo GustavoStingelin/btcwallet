@@ -68,6 +68,63 @@ func newTestSyncer(cfg Config, addrStore waddrmgr.AddrStore,
 	)
 }
 
+// TestSyncerMatchesLivePayments checks native records on the receiving
+// Wallet before a block batch has made its parent transaction readable.
+func TestSyncerMatchesLivePayments(t *testing.T) {
+	t.Parallel()
+
+	// Arrange a real imported witness script. An unknown spend reveals
+	// that script in its witness, and a different spend consumes a parent
+	// from this same block without revealing any script at all.
+	store, vault, id := newSQLScriptVault(t)
+	vector := sqlScriptVectors(t)[1]
+	importSQLScript(t, store, vault, id, vector.addrType,
+		vector.scriptPubKey, vector.stored)
+	s := newTestSyncer(Config{ChainParams: &chainParams},
+		nil, nil, nil, store, id)
+
+	// Import only P2PKH for this key. The bare P2PK output has the
+	// same printable address but must not receive a credit.
+	member, bare, _ := newBareMultisigCreditScript(t)
+	paid := mustPayToAddrScript(member.AddressPubKeyHash())
+	_, err := store.NewImportedAddress(t.Context(), db.NewImportedAddressParams{
+		WalletID: id, AddressType: db.PubKeyHash,
+		ScriptPubKey: paid, PubKey: member.ScriptAddress(),
+	})
+	require.NoError(t, err)
+
+	msg := wire.NewMsgTx(2)
+	msg.AddTxIn(wire.NewTxIn(&wire.OutPoint{Index: 3}, nil, nil))
+	msg.AddTxOut(wire.NewTxOut(1000, paid))
+	msg.AddTxOut(wire.NewTxOut(2000, bare))
+	parent, err := wtxmgr.NewTxRecordFromMsgTx(msg, time.Unix(1, 0))
+	require.NoError(t, err)
+	child := reorgSpend(t, parent, 500)
+
+	input := reorgSpend(t, reorgRecord(t, 12), 300).MsgTx.Copy()
+	input.TxIn[0].Witness = wire.TxWitness{[]byte{1}, vector.stored}
+	unknown, err := wtxmgr.NewTxRecordFromMsgTx(input, time.Unix(2, 0))
+	require.NoError(t, err)
+	foreign := reorgRecord(t, 13)
+
+	// Act on the full ordered batch as delivered by the chain client.
+	matches, err := s.matchLiveTransactions(t.Context(), []*wtxmgr.TxRecord{
+		unknown, foreign, parent, child,
+	})
+
+	// Assert the unrelated transaction is absent. Each input-only match
+	// has no credits, and only the parent's owned output can be credited.
+	require.NoError(t, err)
+	require.Len(t, matches, 3)
+	require.Same(t, unknown, matches[0].Rec)
+	require.Empty(t, matches[0].Entries)
+	require.Same(t, parent, matches[1].Rec)
+	require.Len(t, matches[1].Entries, 1)
+	require.Equal(t, uint32(0), matches[1].Entries[0].Credit.Index)
+	require.Same(t, child, matches[2].Rec)
+	require.Empty(t, matches[2].Entries)
+}
+
 // TestSyncerRollbackRejectsStaleBatch rejects old-branch facts fetched before
 // the historical sync commit path acknowledges a database-wide rollback.
 func TestSyncerRollbackRejectsStaleBatch(t *testing.T) {
