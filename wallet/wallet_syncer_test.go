@@ -125,6 +125,59 @@ func TestSyncerMatchesLivePayments(t *testing.T) {
 	require.Empty(t, matches[2].Entries)
 }
 
+// TestSyncerRetriesLiveOwnershipRead checks that a temporary read failure
+// retains a mempool payment ahead of later notifications.
+func TestSyncerRetriesLiveOwnershipRead(t *testing.T) {
+	t.Parallel()
+
+	// Arrange a paid imported script and a Store mock at the ownership
+	// boundary. The real Store handles the successful lookup and write.
+	store, vault, id := newSQLScriptVault(t)
+	vector := sqlScriptVectors(t)[0]
+	importSQLScript(t, store, vault, id, vector.addrType,
+		vector.scriptPubKey, vector.stored)
+	msg := reorgRecord(t, 14).MsgTx.Copy()
+	msg.TxOut[0].PkScript = vector.scriptPubKey
+	rec, err := wtxmgr.NewTxRecordFromMsgTx(msg, time.Unix(1, 0))
+	require.NoError(t, err)
+
+	events := make(chan any, 2)
+	events <- chain.RelevantTx{TxRecord: rec}
+
+	events <- chain.BlockConnected{}
+
+	failure := errors.New("temporary ownership read")
+	expired := make(chan time.Time)
+	unavailable := &walletmock.Store{}
+	t.Cleanup(func() { unavailable.AssertExpectations(t) })
+	unavailable.On("ResolveOwnedAddresses", mock.Anything,
+		matchResolveOwnedAddressesQuery(id, vector.scriptPubKey)).
+		Run(func(mock.Arguments) { close(expired) }).
+		Return(map[string]*db.AddressInfo(nil), failure).Once()
+	s := newTestSyncer(Config{ChainParams: &chainParams},
+		nil, nil, nil, unavailable, id)
+	s.events = events
+
+	// Act through the retry wait. The failed read expires its original
+	// timer. Resume the pending event with the real Store back online.
+	require.NoError(t, s.waitForRetry(t.Context(), expired))
+	s.store = store
+	event, err := s.prepareLiveEvent(t.Context(), s.pendingEvent)
+	require.NoError(t, err)
+	require.NoError(t, s.processChainEventBeforeSync(t.Context(), event))
+
+	// Assert the unmined payment reached storage and the later header is
+	// still next in the stream. The successful read released the retry slot.
+	tx, err := store.GetTx(t.Context(), db.GetTxQuery{
+		WalletID: id, Txid: rec.Hash,
+	})
+	require.NoError(t, err)
+	require.Nil(t, tx.Block)
+	require.Nil(t, s.pendingEvent)
+	require.Len(t, events, 1)
+	require.IsType(t, chain.BlockConnected{}, <-events)
+}
+
 // TestSyncerRollbackRejectsStaleBatch rejects old-branch facts fetched before
 // the historical sync commit path acknowledges a database-wide rollback.
 func TestSyncerRollbackRejectsStaleBatch(t *testing.T) {

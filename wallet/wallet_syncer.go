@@ -299,6 +299,13 @@ type syncer struct {
 	// processor; every maintained Wallet receives its Manager's instance.
 	chainSyncer    chainRouter
 	chainEventChan <-chan chainEvent
+
+	// events receives native notifications on this Wallet's enrollment.
+	events <-chan any
+
+	// pendingEvent holds the first notification whose evidence still needs
+	// to be read. The worker stops intake until it can settle that read.
+	pendingEvent any
 }
 
 // A compile-time assertion to ensure that syncer implements chainProcessor.
@@ -796,6 +803,87 @@ func (s *syncer) run(ctx context.Context) error {
 			s.state.Store(uint32(syncStateSyncing))
 
 			return err
+		}
+	}
+}
+
+// prepareLiveEvent resolves Wallet ownership before any Store write. Retain
+// the raw event only across a failed read, so an uncertain write cannot turn
+// into a duplicate payment on retry.
+func (s *syncer) prepareLiveEvent(ctx context.Context,
+	n any) (chainEvent, error) {
+
+	event := chainEvent{notification: n}
+
+	var records []*wtxmgr.TxRecord
+	switch msg := n.(type) {
+	case chain.RelevantTx:
+		records = []*wtxmgr.TxRecord{msg.TxRecord}
+	case chain.FilteredBlockConnected:
+		records = msg.RelevantTxs
+	default:
+		return event, nil
+	}
+
+	matches, err := s.matchLiveTransactions(ctx, records)
+	if err != nil {
+		s.pendingEvent = n
+
+		return chainEvent{}, err
+	}
+
+	s.pendingEvent = nil
+	event.matches = matches
+
+	return event, nil
+}
+
+// availableEvents keeps later notifications behind the first unresolved
+// one. A nil receive channel disables only intake in the worker's selects.
+func (s *syncer) availableEvents() <-chan any {
+	if s.pendingEvent != nil {
+		return nil
+	}
+
+	return s.events
+}
+
+// waitForRetry services live payments while the existing retry timer runs.
+// A failed ownership read or a disconnect holds all later events until the
+// next synchronization attempt can establish their order against the chain.
+func (s *syncer) waitForRetry(ctx context.Context,
+	retry <-chan time.Time) error {
+
+	for {
+		select {
+		case n, ok := <-s.availableEvents():
+			if !ok {
+				return ErrWalletShuttingDown
+			}
+
+			// A backend in recovery cannot prove a disconnect yet.
+			if _, ok := n.(chain.BlockDisconnected); ok {
+				s.pendingEvent = n
+				continue
+			}
+
+			err := s.applyBeforeSync(ctx, n)
+
+			// A canceled Store call can complete at the retry deadline.
+			// Exit before letting its result schedule a new attempt.
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+
+			if err != nil {
+				log.Errorf("Chain event failed during retry: %v", err)
+			}
+
+		case <-retry:
+			return nil
+
+		case <-ctx.Done():
+			return ctx.Err()
 		}
 	}
 }
@@ -2072,6 +2160,17 @@ func (s *syncer) handleChainUpdate(n any) {
 	}
 }
 
+// applyBeforeSync matches a native observation after earlier scan writes
+// settle. A deferred notification may spend an output those writes recorded.
+func (s *syncer) applyBeforeSync(ctx context.Context, n any) error {
+	event, err := s.prepareLiveEvent(ctx, n)
+	if err != nil {
+		return err
+	}
+
+	return s.processChainEventBeforeSync(ctx, event)
+}
+
 // processChainEventBeforeSync handles initialization, retry and scan-time
 // observations without checkpointing past payments omitted by live watches.
 func (s *syncer) processChainEventBeforeSync(ctx context.Context,
@@ -2109,6 +2208,11 @@ func (s *syncer) processChainEvent(ctx context.Context,
 		}
 
 	case chain.RelevantTx:
+		// A shared native client also reports other Wallets' payments.
+		if len(event.matches) == 0 {
+			return nil
+		}
+
 		return s.putTxNotifications(ctx, event.matches, n.Block)
 
 	case chain.FilteredBlockConnected:
