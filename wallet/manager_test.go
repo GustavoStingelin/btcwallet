@@ -11,9 +11,12 @@ import (
 	"time"
 
 	"github.com/btcsuite/btcd/address/v2"
+	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcutil/v2/hdkeychain"
 	"github.com/btcsuite/btcd/chaincfg/v2"
 	"github.com/btcsuite/btcd/chainhash/v2"
+	"github.com/btcsuite/btcd/txscript/v2"
+	"github.com/btcsuite/btcd/wire/v2"
 	bwmock "github.com/btcsuite/btcwallet/bwtest/mock"
 	"github.com/btcsuite/btcwallet/chain"
 	"github.com/btcsuite/btcwallet/waddrmgr"
@@ -2809,4 +2812,129 @@ func TestManagerRollbackKvdbAheadOfTip(t *testing.T) {
 	require.NoError(t, err)
 	require.Nil(t, orphan.Block)
 	require.Len(t, orphan.OwnedOutputs, 1)
+}
+
+// TestManagerDeliversPaymentsDuringWatchActivation verifies each admitted
+// Wallet observes a payment emitted synchronously by native watch registration.
+func TestManagerDeliversPaymentsDuringWatchActivation(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: Give both SQL Wallets the same imported receiving script.
+	// Keep the backend behind so historical scanning cannot find either of
+	// the unmined payments used to exercise Create and reopen.
+	key, err := btcec.NewPrivateKey()
+	require.NoError(t, err)
+
+	pubKey := key.PubKey()
+	addr, err := waddrmgr.WitnessPubKey.AddrFromPubKeyBytes(
+		pubKey.SerializeCompressed(), &chainParams,
+	)
+	require.NoError(t, err)
+	script, err := txscript.PayToAddrScript(addr)
+	require.NoError(t, err)
+
+	newPayment := func(tag byte) *wtxmgr.TxRecord {
+		t.Helper()
+
+		// Distinct inputs keep the reopen payment independent of Create.
+		tx := wire.NewMsgTx(2)
+		parent := wire.OutPoint{Hash: chainhash.Hash{tag}}
+		tx.AddTxIn(wire.NewTxIn(&parent, nil, nil))
+		tx.AddTxOut(wire.NewTxOut(1000, script))
+		record, err := wtxmgr.NewTxRecordFromMsgTx(tx, time.Unix(1, 0))
+		require.NoError(t, err)
+
+		return record
+	}
+	createdPayment := newPayment(1)
+	reopenedPayment := newPayment(2)
+	subscriber := make(chan any, 1)
+	client := createTestChain(t)
+	client.On("SubscribeChainEvents", mock.Anything).Unset()
+	enrolled := client.On("SubscribeChainEvents", mock.Anything).
+		Return(chain.EventSubscription{Events: subscriber}).Once()
+	client.On("SubscribeChainEvents", mock.Anything).
+		Return(chain.EventSubscription{}).Once().NotBefore(enrolled)
+	client.On("WatchAddrsFromTip", mock.Anything, mock.Anything).Unset()
+	client.On("WatchAddrsFromTip", mock.Anything, []address.Address(nil)).
+		Return(nil).Twice().NotBefore(enrolled)
+	firstWatch := client.On("WatchAddrsFromTip", mock.Anything,
+		[]address.Address{addr}).Run(func(mock.Arguments) {
+		subscriber <- chain.RelevantTx{TxRecord: createdPayment}
+	}).Return(nil).Once()
+	client.On("WatchAddrsFromTip", mock.Anything, []address.Address{addr}).
+		Return(nil).Once().NotBefore(firstWatch)
+	m := testSQLiteManagerWithChain(t, client)
+
+	// Act: Import the key on the newly created Wallet. The first payment
+	// arrives before the native registration or public import returns.
+	params := sqliteCreateParams(t)
+	first, err := m.Create(params)
+	require.NoError(t, err)
+	require.NoError(t, first.ImportPublicKey(
+		t.Context(), pubKey, waddrmgr.WitnessPubKey,
+	))
+
+	// Assert: The Wallet exposes the payment before any block is mined.
+	require.Eventually(t, func() bool {
+		tx, err := first.GetTx(t.Context(), createdPayment.Hash)
+		return err == nil && tx.Block == nil && tx.Status == TxStatusPublished
+	}, 5*time.Second, time.Millisecond)
+
+	// Arrange reopen with the same receiving interest on a second durable
+	// Wallet. Each listener gets its own native stream on the next Start.
+	params = sqliteCreateParams(t)
+	params.Name = "second"
+	second, err := m.Create(params)
+	require.NoError(t, err)
+	require.NoError(t, second.ImportPublicKey(
+		t.Context(), pubKey, waddrmgr.WitnessPubKey,
+	))
+
+	cfg := m.config
+	require.NoError(t, m.Stop())
+	fresh := createTestChain(t)
+	cfg.ChainSource = fresh
+	streams := []chan any{make(chan any, 1), make(chan any, 1)}
+
+	fresh.On("SubscribeChainEvents", mock.Anything).Unset()
+
+	enrollments := make([]*mock.Call, 0, len(streams))
+	for _, events := range streams {
+		call := fresh.On("SubscribeChainEvents", mock.Anything).
+			Return(chain.EventSubscription{Events: events}).Once()
+		enrollments = append(enrollments, call)
+	}
+
+	// A payment emitted by the first restored watch belongs to both
+	// Wallets. Require both stream enrollments before that watch can run.
+	fresh.On("WatchAddrsFromTip", mock.Anything, mock.Anything).Unset()
+	activation := fresh.On("WatchAddrsFromTip", mock.Anything,
+		[]address.Address{addr}).Run(func(mock.Arguments) {
+		for _, events := range streams {
+			events <- chain.RelevantTx{TxRecord: reopenedPayment}
+		}
+	}).Return(nil).Once().NotBefore(enrollments...)
+	fresh.On("WatchAddrsFromTip", mock.Anything, []address.Address{addr}).
+		Return(nil).Once().NotBefore(activation)
+
+	reopened, err := NewManager(t.Context(), cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = reopened.Stop() })
+
+	// Act: Start the Manager while the first native activation emits into
+	// the two enrolled streams, ahead of the second Wallet's worker.
+	wallets, err := reopened.Start(t.Context())
+	require.NoError(t, err)
+	require.Len(t, wallets, 2)
+
+	// Assert: Independent Wallet workers expose the same unmined payment.
+	for _, w := range wallets {
+		require.Eventually(t, func() bool {
+			tx, err := w.GetTx(t.Context(), reopenedPayment.Hash)
+
+			return err == nil && tx.Block == nil &&
+				tx.Status == TxStatusPublished
+		}, 5*time.Second, time.Millisecond)
+	}
 }
