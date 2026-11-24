@@ -46,8 +46,8 @@ func newTestSyncer(cfg Config, addrStore waddrmgr.AddrStore,
 	txStore wtxmgr.TxStore, publisher txRebroadcaster, store db.Store,
 	walletID uint32) *syncer {
 
-	// Keep the existing mock publisher and use a real, empty registry for
-	// observations outside these persistence tests' subscription contract.
+	// These tests exercise Wallet storage with a mock publisher and the
+	// normal post-commit notification path.
 	manager := struct {
 		txRebroadcaster
 		txNotifier
@@ -56,15 +56,9 @@ func newTestSyncer(cfg Config, addrStore waddrmgr.AddrStore,
 		txNotifier:      &Wallet{},
 	}
 
-	// Keep live preparation on the same source/network as historical work.
-	params := cfg.ChainParams
-	if params == nil {
-		params = &chainParams
-	}
-
 	return newSyncer(
 		cfg, addrStore, txStore, manager, store, walletID,
-		newChainSyncer(cfg.Chain, params), make(chan any, 1),
+		make(chan any, 1),
 	)
 }
 
@@ -1782,10 +1776,28 @@ func TestAdvanceChainSync(t *testing.T) {
 	store.AssertExpectations(t)
 }
 
-// liveMatches builds Manager-prepared event data for processor tests using
-// the real output parser without subscribing a chain source.
+// liveMatches supplies decoded output candidates to Store application tests.
+// Ownership tests enter through the worker with native records instead.
 func liveMatches(recs ...*wtxmgr.TxRecord) TxEntries {
-	return newChainSyncer(nil, &chainParams).prepareTxMatches(recs)
+	var matches TxEntries
+	for _, rec := range recs {
+		entry := TxEntry{Rec: rec}
+		// Preserve output order when supplying credits to the Store.
+		byOutput := extractTxAddrs(&rec.MsgTx, &chainParams)
+		for i := range rec.MsgTx.TxOut {
+			index := uint32(i)
+			for _, addr := range byOutput[index] {
+				entry.Entries = append(entry.Entries, AddrEntry{
+					Address: addr,
+					Credit:  wtxmgr.CreditEntry{Index: index},
+				})
+			}
+		}
+
+		matches = append(matches, entry)
+	}
+
+	return matches
 }
 
 // TestHandleChainUpdate verifies notification handling.
@@ -4783,32 +4795,6 @@ func TestLoadWalletScanDataStore(t *testing.T) {
 	store.AssertExpectations(t)
 }
 
-// TestExtractAddrEntries verifies address extraction from outputs.
-func TestExtractAddrEntries(t *testing.T) {
-	t.Parallel()
-
-	// Arrange: Create a standard P2PKH output whose address and credit index
-	// can be checked without any processor or persistence dependencies.
-	addr, err := address.NewAddressPubKeyHash(
-		make([]byte, 20), &chainParams,
-	)
-	require.NoError(t, err)
-	pkScript, err := txscript.PayToAddrScript(addr)
-	require.NoError(t, err)
-
-	txOut := &wire.TxOut{Value: 1000, PkScript: pkScript}
-
-	s := newChainSyncer(nil, &chainParams)
-
-	// Act: Extract address entries from the output.
-	entries := s.extractAddrEntries([]*wire.TxOut{txOut})
-
-	// Assert: Verify that the correct address was extracted.
-	require.Len(t, entries, 1)
-	require.Equal(t, addr.String(), entries[0].Address.String())
-	require.Equal(t, uint32(0), entries[0].Credit.Index)
-}
-
 // matchRewindWalletParams returns a matcher for one wallet-scoped manual
 // rescan rewind target.
 func matchRewindWalletParams(walletID uint32,
@@ -5006,7 +4992,6 @@ func TestWaitForEventTargetedScanResults(t *testing.T) {
 
 			mockChain := &bwmock.Chain{}
 			s.cfg.Chain = mockChain
-			s.chainSyncer = newChainSyncer(mockChain, s.cfg.ChainParams)
 
 			mockChain.On("GetBestBlock").Run(func(mock.Arguments) {
 				require.Equal(
@@ -6205,12 +6190,11 @@ func TestScanWithTargetsPreservesLiveSyncState(t *testing.T) {
 			defer mockChain.AssertExpectations(t)
 
 			s.cfg.Chain = mockChain
-			s.chainSyncer = newChainSyncer(mockChain, s.cfg.ChainParams)
+
 			s.cfg.SyncMethod = SyncMethodAuto
 			s.cfg.MaxCFilterItems = 100
 			s.cfg.RecoveryWindow = testScanRecoveryWindow
 			other.cfg.Chain = mockChain
-			other.chainSyncer = newChainSyncer(mockChain, other.cfg.ChainParams)
 
 			syncedToBefore, err := s.syncedTo(t.Context())
 			require.NoError(t, err)
@@ -6331,7 +6315,7 @@ func TestScanWithTargets_Empty(t *testing.T) {
 	defer mockChain.AssertExpectations(t)
 
 	s.cfg.Chain = mockChain
-	s.chainSyncer = newChainSyncer(mockChain, s.cfg.ChainParams)
+
 	s.cfg.SyncMethod = SyncMethodAuto
 	s.cfg.MaxCFilterItems = 100
 	s.cfg.RecoveryWindow = testScanRecoveryWindow
@@ -6543,7 +6527,7 @@ func TestScanWithTargets_Errors(t *testing.T) {
 
 		mockChain := &bwmock.Chain{}
 		s.cfg.Chain = mockChain
-		s.chainSyncer = newChainSyncer(mockChain, s.cfg.ChainParams)
+
 		s.cfg.RecoveryWindow = testScanRecoveryWindow
 
 		req := &scanReq{
@@ -6576,7 +6560,7 @@ func TestScanWithTargets_Errors(t *testing.T) {
 
 		mockChain := &bwmock.Chain{}
 		s.cfg.Chain = mockChain
-		s.chainSyncer = newChainSyncer(mockChain, s.cfg.ChainParams)
+
 		s.cfg.RecoveryWindow = testScanRecoveryWindow
 
 		req := &scanReq{
@@ -7651,43 +7635,6 @@ func TestDispatchScanStrategy_FullBlocksError(t *testing.T) {
 	require.ErrorIs(t, err, errBlocks)
 }
 
-// TestExtractAddrEntries_NonStd verifies non-standard script handling.
-func TestExtractAddrEntries_NonStd(t *testing.T) {
-	t.Parallel()
-
-	// Arrange: Mix malformed, OP_RETURN, and standard scripts to verify the
-	// shared parser retains only outputs that provide address candidates.
-	pkh, err := address.NewAddressPubKeyHash(
-		make([]byte, 20), &chainParams,
-	)
-	require.NoError(t, err)
-	pkScript, err := txscript.PayToAddrScript(pkh)
-	require.NoError(t, err)
-
-	txOuts := []*wire.TxOut{
-		{
-			// OP_DATA_1 but no data byte follows. (Error path)
-			PkScript: []byte{0x01},
-		},
-		{
-			// OP_RETURN (Empty addrs, no error)
-			PkScript: []byte{0x6a, 0x04, 0xde, 0xad, 0xbe, 0xef},
-		},
-		{
-			// Standard P2PKH (Success path)
-			PkScript: pkScript,
-		},
-	}
-
-	s := newChainSyncer(nil, &chainParams)
-
-	// Act: Extract address entries.
-	entries := s.extractAddrEntries(txOuts)
-
-	// Assert: Verify that only the standard P2PKH output was extracted.
-	require.Len(t, entries, 1)
-}
-
 // TestAdvanceChainSync_GetBestBlockError verifies error propagation.
 func TestAdvanceChainSync_GetBestBlockError(t *testing.T) {
 	t.Parallel()
@@ -8638,7 +8585,7 @@ func TestTxSubscriptionPostCommitRead(t *testing.T) {
 			w, deps := createStartedWalletWithMocks(t)
 			s := newSyncer(
 				w.cfg, w.addrStore, w.txStore, w,
-				deps.store, w.id, w.chainSyncer, w.chainEventChan,
+				deps.store, w.id, w.chainEventChan,
 			)
 			events, _, err := w.SubscribeTxns(t.Context())
 			require.NoError(t, err)
@@ -8697,7 +8644,7 @@ func TestTxSubscriptionCommitFailure(t *testing.T) {
 	w, deps := createStartedWalletWithMocks(t)
 	s := newSyncer(
 		w.cfg, w.addrStore, w.txStore, w,
-		deps.store, w.id, w.chainSyncer, w.chainEventChan,
+		deps.store, w.id, w.chainEventChan,
 	)
 	events, _, err := w.SubscribeTxns(t.Context())
 	require.NoError(t, err)

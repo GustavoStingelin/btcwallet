@@ -233,6 +233,12 @@ type prepareRollbackReq struct {
 	rollbackDone     <-chan struct{}
 }
 
+// chainEvent pairs native metadata with the credits resolved by this Wallet.
+type chainEvent struct {
+	notification any
+	matches      TxEntries
+}
+
 // chainProcessor abstracts Wallet event processing and recovery, allowing
 // Wallet and controller tests to replace the existing worker.
 type chainProcessor interface {
@@ -297,10 +303,6 @@ type syncer struct {
 	// observations while Wallet retains subscriber state and lifecycle.
 	txManager txManager
 
-	// chainSyncer owns subscriptions and prepares live matches for this
-	// processor; every maintained Wallet receives its Manager's instance.
-	chainSyncer chainRouter
-
 	// events receives native notifications on this Wallet's enrollment.
 	events <-chan any
 
@@ -345,7 +347,7 @@ func (s *syncer) refreshLiveWatches(ctx context.Context) error {
 
 	// Wallet shutdown must still cancel registration. A later sync
 	// initialization reads the persisted watch set again.
-	err = s.chainSyncer.watchAddresses(ctx, s.walletID, addrs)
+	err = s.cfg.Chain.WatchAddrsFromTip(ctx, addrs)
 	if err != nil {
 		return fmt.Errorf("register addresses: %w", err)
 	}
@@ -360,7 +362,18 @@ func (s *syncer) refreshLiveWatches(ctx context.Context) error {
 		outpoints = append(outpoints, &watches.OutPoints[i])
 	}
 
-	return s.chainSyncer.watchOutpoints(ctx, s.walletID, outpoints)
+	// NotifySpent cannot cancel in flight. Honor Stop before entering it.
+	err = ctx.Err()
+	if err != nil {
+		return err
+	}
+
+	err = s.cfg.Chain.NotifySpent(outpoints)
+	if err != nil {
+		return fmt.Errorf("watch chain outpoints: %w", err)
+	}
+
+	return nil
 }
 
 // watchAddress decodes a receiving script for live and recovery watches.
@@ -383,12 +396,11 @@ func (s *syncer) watchAddress(script []byte) (address.Address, error) {
 // newSyncer creates a new syncer instance. The Store and its wallet ID are
 // mandatory: every migrated runtime path reads and writes through the Store,
 // so there is no nil-store fallback. The notifier observes successful commits
-// without owning persistence or scan lifecycle. The Manager's required routing
-// owner and inbox supply prepared live events to this existing worker.
+// without owning persistence or scan lifecycle. The worker matches native
+// payments using its Wallet's own history.
 func newSyncer(cfg Config, addrStore waddrmgr.AddrStore,
 	txStore wtxmgr.TxStore, txManager txManager, store db.Store,
-	walletID uint32, chainSyncer chainRouter,
-	events <-chan any) *syncer {
+	walletID uint32, events <-chan any) *syncer {
 
 	return &syncer{
 		cfg:         cfg,
@@ -398,7 +410,6 @@ func newSyncer(cfg Config, addrStore waddrmgr.AddrStore,
 		txManager:   txManager,
 		store:       store,
 		walletID:    walletID,
-		chainSyncer: chainSyncer,
 		events:      events,
 	}
 }
@@ -454,7 +465,14 @@ func (s *syncer) initChainSync(ctx context.Context) error {
 	// this call a btcd-backed wallet would stop receiving live block
 	// connect/disconnect events. The call is idempotent on the wrappers
 	// that already enabled notifications, so it is safe for all backends.
-	err = s.chainSyncer.notifyBlocks(ctx)
+	//
+	// NotifyBlocks has no context. Skip the call if Stop has begun.
+	err = ctx.Err()
+	if err != nil {
+		return err
+	}
+
+	err = s.cfg.Chain.NotifyBlocks()
 	if err != nil {
 		return fmt.Errorf("unable to start block "+
 			"notifications: %w", err)

@@ -2365,7 +2365,7 @@ func TestBroadcastDelayedReplyKeepsSyncerCandidate(t *testing.T) {
 
 	s := newSyncer(
 		w.cfg, w.addrStore, w.txStore, w, w.store, w.id,
-		w.chainSyncer, w.chainEventChan,
+		w.chainEventChan,
 	)
 
 	// Act: Commit C through the actual notification path while B's reply is
@@ -2530,7 +2530,7 @@ func TestRebroadcastStaleSnapshotKeepsDeletedBranch(t *testing.T) {
 	)
 	s := newSyncer(
 		w.cfg, w.addrStore, w.txStore, w, snapshotStore, w.id,
-		w.chainSyncer, w.chainEventChan,
+		w.chainEventChan,
 	)
 
 	// Act: Run the actual syncer retry against the captured, now stale rows.

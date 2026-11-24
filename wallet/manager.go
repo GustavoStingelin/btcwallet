@@ -163,9 +163,6 @@ type Manager struct {
 	// config is the immutable shared policy retained at construction.
 	config ManagerConfig
 
-	// chainSyncer owns live routing for every Wallet served by this Manager.
-	chainSyncer chainRouter
-
 	// lifetimeCtx outlives construction and startup requests. Wallets keep
 	// their own lifetimes; canceling this one releases shared event delivery.
 	//nolint:containedctx // Manager owns and joins the shared reader lifetime.
@@ -260,8 +257,6 @@ func NewManager(ctx context.Context, cfg ManagerConfig) (*Manager, error) {
 		cancel:      cancel,
 	}
 
-	m.chainSyncer = newChainSyncer(m.config.ChainSource, &m.config.ChainParams)
-
 	return m, nil
 }
 
@@ -280,7 +275,7 @@ func (m *Manager) startWallets(ctx context.Context) ([]*Wallet, error) {
 			return wallets, err
 		}
 
-		wallet := newManagedWallet(cfg, walletData, m.chainSyncer)
+		wallet := newManagedWallet(cfg, walletData)
 		wallets = append(wallets, wallet)
 
 		err = wallet.start(ctx)
@@ -753,7 +748,7 @@ func (m *Manager) createWallet(ctx context.Context,
 		return nil, err
 	}
 
-	return newManagedWallet(walletCfg, data, m.chainSyncer), nil
+	return newManagedWallet(walletCfg, data), nil
 }
 
 // validateInitialAccounts checks resolved scope and script ownership before

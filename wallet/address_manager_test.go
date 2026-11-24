@@ -3379,7 +3379,7 @@ func TestNewAddressKVDBAllocatesSuccessive(t *testing.T) {
 }
 
 // TestNewAddressKVDBRoutesLiveTransactions prevents native address activation
-// from bypassing Manager ownership and losing the first payment notification.
+// from losing the first payment before its address is visible to the worker.
 func TestNewAddressKVDBRoutesLiveTransactions(t *testing.T) {
 	t.Parallel()
 
@@ -3394,6 +3394,9 @@ func TestNewAddressKVDBRoutesLiveTransactions(t *testing.T) {
 	params.PubPassphrase = []byte("public")
 	w, err := m.Create(params)
 	require.NoError(t, err)
+
+	processor, ok := w.sync.(*syncer)
+	require.True(t, ok)
 
 	var (
 		callbackErr error
@@ -3423,10 +3426,9 @@ func TestNewAddressKVDBRoutesLiveTransactions(t *testing.T) {
 			return
 		}
 
-		events := m.chainSyncer.routeChainEvent(
-			chain.RelevantTx{TxRecord: record}, []*Wallet{w},
+		matched, callbackErr = processor.matchLiveTransactions(
+			t.Context(), []*wtxmgr.TxRecord{record},
 		)
-		matched = events[w.id].matches
 	}).Return(nil).Once()
 
 	// Act: Allocate through the public single-address API; its response joins
