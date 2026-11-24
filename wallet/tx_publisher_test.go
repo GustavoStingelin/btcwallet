@@ -345,7 +345,7 @@ func TestExtractTxAddrs(t *testing.T) {
 	testData := createTestTx(t, w)
 
 	// Extract addresses.
-	extractedAddrs := w.extractTxAddrs(testData.tx)
+	extractedAddrs := extractTxAddrs(testData.tx, w.cfg.ChainParams)
 
 	// Check the results.
 	// We expect 4 entries in the map, one for each output.
@@ -402,14 +402,14 @@ func TestFilterOwnedAddresses(t *testing.T) {
 		).Return(ownedAddrsResult(ownedScript), nil).Once()
 
 		// Filter the addresses.
-		ownedAddrs, err := w.filterOwnedAddresses(
-			t.Context(), txOutAddrs,
+		ownedAddrs, err := filterOwnedAddresses(
+			t.Context(), w.store, w.id, txOutAddrs,
 		)
 		require.NoError(t, err)
 
 		// Check that the result contains only the owned address.
 		require.Len(t, ownedAddrs, 1)
-		info, ok := ownedAddrs[ownedAddr.EncodeAddress()]
+		info, ok := ownedAddrs[string(ownedScript)]
 		require.True(t, ok)
 		require.ElementsMatch(t, []uint32{uint32(0), uint32(2)},
 			info.outputIndices)
@@ -440,14 +440,14 @@ func TestFilterOwnedAddresses(t *testing.T) {
 			matchResolveOwnedAddressesQuery(w.id, ownedScript, otherScript),
 		).Return(ownedAddrsResult(ownedScript), nil).Once()
 
-		ownedAddrs, err := w.filterOwnedAddresses(
-			t.Context(), txOutAddrs,
+		ownedAddrs, err := filterOwnedAddresses(
+			t.Context(), w.store, w.id, txOutAddrs,
 		)
 		require.NoError(t, err)
 
 		// Only the owned member is recognized, mapped to output 0.
 		require.Len(t, ownedAddrs, 1)
-		info, ok := ownedAddrs[ownedAddr.EncodeAddress()]
+		info, ok := ownedAddrs[string(ownedScript)]
 		require.True(t, ok)
 		require.ElementsMatch(t, []uint32{uint32(0)},
 			info.outputIndices)
@@ -482,7 +482,7 @@ func TestFilterOwnedAddresses(t *testing.T) {
 			}
 
 			ownedScripts = append(ownedScripts, script)
-			ownedKeys[addr.EncodeAddress()] = struct{}{}
+			ownedKeys[string(script)] = struct{}{}
 		}
 
 		// The whole script set is resolved in exactly one call, which
@@ -491,8 +491,8 @@ func TestFilterOwnedAddresses(t *testing.T) {
 			matchResolveOwnedAddressesQuery(w.id, scripts...),
 		).Return(ownedAddrsResult(ownedScripts...), nil).Once()
 
-		ownedAddrs, err := w.filterOwnedAddresses(
-			t.Context(), txOutAddrs,
+		ownedAddrs, err := filterOwnedAddresses(
+			t.Context(), w.store, w.id, txOutAddrs,
 		)
 		require.NoError(t, err)
 
@@ -1017,7 +1017,7 @@ func TestSpendsWalletOutputConflictingNoChangeSpend(t *testing.T) {
 		OwnedOutputs: []db.TxOwnedOutput{{Index: 1, Amount: 5000}},
 	}, nil).Once()
 
-	spendsOurs, err := w.spendsWalletOutput(t.Context(), tx)
+	spendsOurs, err := spendsWalletOutput(t.Context(), w.store, w.id, tx)
 	require.NoError(t, err)
 
 	// The conflicting spend must not be classified as wallet-unrelated.

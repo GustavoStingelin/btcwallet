@@ -504,15 +504,13 @@ func BenchmarkFilterOwnedAddresses(b *testing.B) {
 			}
 
 			store := &countingAddrStore{owned: owned}
-			w := &Wallet{store: store}
-			w.cache = newStoreRuntimeCache(store)
 
 			b.ReportAllocs()
 			b.ResetTimer()
 
 			for b.Loop() {
-				_, err := w.filterOwnedAddresses(
-					b.Context(), txOutAddrs,
+				_, err := filterOwnedAddresses(
+					b.Context(), store, 0, txOutAddrs,
 				)
 				require.NoError(b, err)
 			}

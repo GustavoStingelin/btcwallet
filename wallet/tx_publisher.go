@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/btcsuite/btcd/address/v2"
+	"github.com/btcsuite/btcd/chaincfg/v2"
 	"github.com/btcsuite/btcd/chainhash/v2"
 	"github.com/btcsuite/btcd/rpcclient"
 	"github.com/btcsuite/btcd/txscript/v2"
@@ -163,7 +164,9 @@ func (w *Wallet) handleRebroadcast(r rebroadcastReq) {
 
 	// Reuse only read-only ownership resolution, never addTxToWallet: a
 	// concurrent delete must not turn this stale retry into a new record.
-	owned, err := w.filterOwnedAddresses(r.ctx, w.extractTxAddrs(r.tx))
+	outputs := extractTxAddrs(r.tx, w.cfg.ChainParams)
+
+	owned, err := filterOwnedAddresses(r.ctx, w.store, w.id, outputs)
 	if err != nil {
 		r.respErrChan <- err
 
@@ -557,11 +560,13 @@ func (w *Wallet) addTxToWallet(ctx context.Context, tx *wire.MsgTx,
 	// Stage 1: Extract potential addresses from all transaction outputs.
 	// This is a CPU-intensive operation that is performed entirely in
 	// memory, without holding any database locks.
-	txOutAddrs := w.extractTxAddrs(tx)
+	txOutAddrs := extractTxAddrs(tx, w.cfg.ChainParams)
 
 	// Stage 2: Filter the extracted addresses to find which ones are owned
 	// by the wallet.
-	ownedAddrs, err := w.filterOwnedAddresses(ctx, txOutAddrs)
+	ownedAddrs, err := filterOwnedAddresses(
+		ctx, w.store, w.id, txOutAddrs,
+	)
 	if err != nil {
 		return nil, false, err
 	}
@@ -570,7 +575,7 @@ func (w *Wallet) addTxToWallet(ctx context.Context, tx *wire.MsgTx,
 	// sweep that spends our own coins. We check the input side before
 	// giving up so the tx is still tracked (and can later be removed).
 	if len(ownedAddrs) == 0 {
-		spendsOurs, err := w.spendsWalletOutput(ctx, tx)
+		spendsOurs, err := spendsWalletOutput(ctx, w.store, w.id, tx)
 		if err != nil {
 			return nil, false, err
 		}
@@ -747,11 +752,13 @@ func (w *Wallet) handleExistingTx(ctx context.Context, tx *wire.MsgTx,
 // extractTxAddrs extracts all potential addresses from a transaction's outputs.
 // This is a CPU-intensive function that should be run outside of a database
 // transaction.
-func (w *Wallet) extractTxAddrs(tx *wire.MsgTx) map[uint32][]address.Address {
+func extractTxAddrs(tx *wire.MsgTx,
+	params *chaincfg.Params) map[uint32][]address.Address {
+
 	txOutAddrs := make(map[uint32][]address.Address)
 	for i, output := range tx.TxOut {
 		_, addrs, _, err := txscript.ExtractPkScriptAddrs(
-			output.PkScript, w.cfg.ChainParams,
+			output.PkScript, params,
 		)
 		// Ignore non-standard scripts.
 		if err != nil {
@@ -771,31 +778,34 @@ func (w *Wallet) extractTxAddrs(tx *wire.MsgTx) map[uint32][]address.Address {
 	return txOutAddrs
 }
 
-// filterOwnedAddresses takes a map of output indexes to addresses and returns a
-// new map containing only the addresses that are owned by the wallet. This
-// function is a key part of the wallet's performance strategy. It efficiently
-// filters a potentially large set of addresses down to the small subset that
-// the wallet needs to act on.
-//
-// The function is optimized to handle transactions with multiple outputs paying
-// to the same address. It internally de-duplicates the addresses and resolves
-// wallet ownership for the entire set with a single batched Store lookup,
-// rather than one lookup per address.
-func (w *Wallet) filterOwnedAddresses(ctx context.Context,
+// filterOwnedAddresses resolves scripts in one Store read. Its result maps
+// each owned payment script to its address and matching output indices.
+func filterOwnedAddresses(ctx context.Context, store db.Store, walletID uint32,
 	txOutAddrs map[uint32][]address.Address) (
 	map[string]ownedAddrInfo, error) {
 
 	ownedAddrs := make(map[string]ownedAddrInfo)
 
-	// Pre-deduplicate addresses outside the Store write path.
+	// Resolve each member by payment script. P2PK and P2PKH share an
+	// address encoding, while bare multisig embeds several member keys.
 	uniqueAddrs := make(map[string]ownedAddrInfo)
+
+	var scripts [][]byte
+
 	for index, addrs := range txOutAddrs {
 		for _, addr := range addrs {
-			key := addr.EncodeAddress()
+			script, err := txscript.PayToAddrScript(addr)
+			if err != nil {
+				return nil, err
+			}
+
+			key := string(script)
 			info := uniqueAddrs[key]
 
 			if info.addr == nil {
 				info.addr = addr
+
+				scripts = append(scripts, script)
 			}
 
 			info.outputIndices = append(info.outputIndices, index)
@@ -803,40 +813,13 @@ func (w *Wallet) filterOwnedAddresses(ctx context.Context,
 		}
 	}
 
-	// Resolve each unique address by its own script rather than the whole
-	// output script. For a single-address output these are identical, but
-	// for a bare-multisig output it correctly resolves the wallet-owned
-	// member, which the multisig script itself would never match.
-	//
-	// The scripts are gathered up front so the wallet-ownership question is
-	// answered with a single batched Store lookup instead of one lookup per
-	// address.
-	scriptToKey := make(map[string]string, len(uniqueAddrs))
-	scripts := make([][]byte, 0, len(uniqueAddrs))
-
-	for key, info := range uniqueAddrs {
-		ownScript, err := txscript.PayToAddrScript(info.addr)
-		if err != nil {
-			return nil, err
-		}
-
-		scriptKey := string(ownScript)
-		if _, ok := scriptToKey[scriptKey]; ok {
-			continue
-		}
-
-		scriptToKey[scriptKey] = key
-
-		scripts = append(scripts, ownScript)
-	}
-
 	// Ask the Store which of the gathered scripts are wallet-owned in one
 	// operation. A script present in the result map is owned; an absent one
 	// simply does not belong to the wallet, which is the expected case for
 	// most addresses.
-	owned, err := w.store.ResolveOwnedAddresses(
+	owned, err := store.ResolveOwnedAddresses(
 		ctx, db.ResolveOwnedAddressesQuery{
-			WalletID:      w.id,
+			WalletID:      walletID,
 			ScriptPubKeys: scripts,
 		},
 	)
@@ -851,8 +834,7 @@ func (w *Wallet) filterOwnedAddresses(ctx context.Context,
 			continue
 		}
 
-		key := scriptToKey[scriptKey]
-		ownedAddrs[key] = uniqueAddrs[key]
+		ownedAddrs[scriptKey] = uniqueAddrs[scriptKey]
 	}
 
 	return ownedAddrs, nil
@@ -872,7 +854,7 @@ func (w *Wallet) filterOwnedAddresses(ctx context.Context,
 // wallet-owned outputs, which persist in the store even after the output is
 // spent, instead of treating an absent current UTXO as proof of
 // non-ownership.
-func (w *Wallet) spendsWalletOutput(ctx context.Context,
+func spendsWalletOutput(ctx context.Context, store db.Store, walletID uint32,
 	tx *wire.MsgTx) (bool, error) {
 
 	// Cache parent-tx ownership lookups so several inputs spending the same
@@ -882,8 +864,8 @@ func (w *Wallet) spendsWalletOutput(ctx context.Context,
 	for _, txIn := range tx.TxIn {
 		outPoint := txIn.PreviousOutPoint
 
-		_, err := w.store.GetUtxo(ctx, db.GetUtxoQuery{
-			WalletID: w.id,
+		_, err := store.GetUtxo(ctx, db.GetUtxoQuery{
+			WalletID: walletID,
 			OutPoint: outPoint,
 		})
 		if err == nil {
@@ -899,8 +881,8 @@ func (w *Wallet) spendsWalletOutput(ctx context.Context,
 		// The output is not a current UTXO. It may still be a wallet
 		// output already spent by another unmined wallet tx, which the
 		// parent's recorded owned outputs reveal.
-		ownedOutputs, err := w.walletOwnedOutputs(
-			ctx, outPoint.Hash, ownedParents,
+		ownedOutputs, err := walletOwnedOutputs(
+			ctx, store, walletID, outPoint.Hash, ownedParents,
 		)
 		if err != nil {
 			return false, err
@@ -918,7 +900,7 @@ func (w *Wallet) spendsWalletOutput(ctx context.Context,
 // the transaction identified by txHash, memoizing the per-parent lookup in
 // cache. A parent the wallet does not record contributes an empty set, so its
 // outputs are treated as not wallet-owned.
-func (w *Wallet) walletOwnedOutputs(ctx context.Context,
+func walletOwnedOutputs(ctx context.Context, store db.Store, walletID uint32,
 	txHash chainhash.Hash,
 	cache map[chainhash.Hash]map[uint32]struct{}) (map[uint32]struct{},
 	error) {
@@ -927,8 +909,8 @@ func (w *Wallet) walletOwnedOutputs(ctx context.Context,
 		return owned, nil
 	}
 
-	detail, err := w.store.GetTxDetail(ctx, db.GetTxDetailQuery{
-		WalletID: w.id,
+	detail, err := store.GetTxDetail(ctx, db.GetTxDetailQuery{
+		WalletID: walletID,
 		Txid:     txHash,
 	})
 
