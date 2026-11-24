@@ -9277,6 +9277,266 @@ func TestManagerRollbackKvdbOrphanCoinbaseSpends(t *testing.T) {
 	require.Equal(t, coinbase.Hash, history[0].Hash)
 }
 
+// TestSyncerRollbackTargetedDisconnectFailure returns a consumed disconnect
+// failure to worker recovery instead of the targeted-scan local-error policy.
+func TestSyncerRollbackTargetedDisconnectFailure(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: An empty targeted horizon fetches one block while a queued
+	// disconnect fails its committed-Wallet read before any Store write.
+	store := &walletmock.Store{}
+	source := &bwmock.Chain{}
+	source.On("IsCurrent").Return(true).Once()
+	t.Cleanup(func() {
+		store.AssertExpectations(t)
+		source.AssertExpectations(t)
+	})
+
+	s := newTestSyncer(Config{
+		Chain:       source,
+		ChainParams: &chainParams,
+	}, nil, nil, nil, store, 7)
+	events := make(chan any, 1)
+	s.events = events
+	s.state.Store(uint32(syncStateSynced))
+	store.On("ListAccounts", mock.Anything, mock.Anything).
+		Return([]db.AccountInfo(nil), nil).Twice()
+	expectImportedScanAddressPage(
+		store, 7, page.Result[db.AddressInfo, uint32]{},
+	)
+	store.On("ListOutputsToWatch", mock.Anything, uint32(7)).
+		Return([]db.UtxoInfo(nil), nil).Once()
+
+	hash := chainhash.Hash{1}
+	source.On("GetBestBlock").Return(&hash, int32(1), nil).Once()
+	source.On("GetBlockHashes", int64(1), int64(1)).
+		Return([]chainhash.Hash{hash}, nil).Once()
+	source.On("GetBlockHeaders", []chainhash.Hash{hash}).Return(
+		[]*wire.BlockHeader{{Timestamp: time.Unix(1, 0)}}, nil,
+	).Once()
+
+	failure := errors.New("disconnect read failed")
+	store.On("GetWallet", mock.Anything, s.cfg.Name).
+		Return((*db.WalletInfo)(nil), failure).Once()
+
+	events <- chain.BlockDisconnected{
+		Block: wtxmgr.Block{Height: 1, Hash: hash},
+	}
+
+	// Act: Execute the accepted scan through the real worker-facing handler.
+	err := s.handleScanEvent(t.Context(), &scanReq{
+		typ:        scanTypeTargeted,
+		startBlock: waddrmgr.BlockStamp{Height: 1},
+	})
+
+	// Assert: Recovery failure must escape with readiness revoked. Cleanup
+	// proves the queued disconnect, rather than another operation, failed.
+	require.ErrorIs(t, err, failure)
+	require.Equal(t, syncStateSyncing, s.syncState())
+}
+
+// TestSyncerIgnoresCanonicalDisconnect completes a delayed event that
+// names a block still on the source chain without submitting a Store rewind.
+func TestSyncerIgnoresCanonicalDisconnect(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: The Wallet saved block one. Its native disconnect was queued
+	// before the source returned to it. Strict Store reads permit no write.
+	store := &walletmock.Store{}
+	source := &bwmock.Chain{}
+	t.Cleanup(func() {
+		store.AssertExpectations(t)
+		source.AssertExpectations(t)
+	})
+
+	fork := db.Block{Timestamp: time.Unix(0, 0).UTC()}
+	tip := db.Block{Height: 1, Hash: chainhash.Hash{1}}
+	s := newTestSyncer(Config{Chain: source}, nil, nil, nil, store, 7)
+	store.On("GetWallet", mock.Anything, s.cfg.Name).
+		Return(&db.WalletInfo{SyncedTo: &tip}, nil).Once()
+	store.On("ListSyncedBlocks", mock.Anything, db.ListSyncedBlocksQuery{
+		WalletID: 7, StartHeight: 0, EndHeight: 0,
+	}).Return([]db.Block{fork}, nil).Once()
+	store.On("ListTxns", mock.Anything, db.ListTxnsQuery{
+		WalletID: 7, StartHeight: 1, EndHeight: math.MaxInt32,
+	}).Return([]db.TxInfo(nil), nil).Once()
+	source.On("IsCurrent").Return(true).Once()
+	source.On("GetBestBlock").Return(&tip.Hash, int32(1), nil).Twice()
+	source.On("GetBlockHash", int64(0)).Return(&fork.Hash, nil).Once()
+	source.On("GetBlockHeader", &fork.Hash).
+		Return(&wire.BlockHeader{Timestamp: fork.Timestamp}, nil).Once()
+	expectDisconnectHeaders(source, 1, fork.Hash, tip.Hash)
+
+	// Act: Deliver the queued observation to the worker using the same
+	// handler that owns retries while it waits for a current chain.
+	err := s.processChainEvent(t.Context(), chainEvent{
+		notification: chain.BlockDisconnected{
+			Block: wtxmgr.Block{Height: 1, Hash: tip.Hash},
+		},
+	})
+
+	// Assert: Success releases ordered intake. The strict Store would fail
+	// immediately if a still-current observation were submitted for rewind.
+	require.NoError(t, err)
+	require.Nil(t, s.pendingEvent)
+}
+
+// TestSyncerDisconnectCarriesForkEvidence preserves skipped empty-block proof
+// without walking a retained tail or repeating native hash lookups.
+func TestSyncerDisconnectCarriesForkEvidence(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: The saved tip is three, but an empty observation was retained
+	// far above progress. Only committed rows and mined identities need proof.
+	store := &walletmock.Store{}
+	client := &bwmock.Chain{}
+	client.On("IsCurrent").Return(true).Once()
+	t.Cleanup(func() {
+		store.AssertExpectations(t)
+		client.AssertExpectations(t)
+	})
+
+	s := newTestSyncer(Config{Chain: client}, nil, nil, nil, store, 7)
+	s.state.Store(uint32(syncStateSynced))
+
+	fork := db.Block{
+		Height:    1,
+		Hash:      chainhash.Hash{1},
+		Timestamp: time.Unix(1, 0).UTC(),
+	}
+	tip := db.Block{Height: 3, Hash: chainhash.Hash{3}}
+	observed := db.Block{
+		Height: 1000, Hash: chainhash.Hash{2},
+		Timestamp: time.Unix(2, 0).UTC(),
+	}
+	replacement := chainhash.Hash{99}
+
+	store.On("GetWallet", mock.Anything, s.cfg.Name).Return(
+		&db.WalletInfo{SyncedTo: &tip}, nil,
+	).Once()
+	client.On("GetBestBlock").Return(&replacement, int32(2), nil).Twice()
+	store.On("ListSyncedBlocks", mock.Anything, db.ListSyncedBlocksQuery{
+		WalletID: 7, StartHeight: 0, EndHeight: 2,
+	}).Return([]db.Block{
+		{
+			Height: 0,
+		},
+		fork,
+		{
+			Height: 2, Hash: chainhash.Hash{2},
+		},
+	}, nil).Once()
+	expectDisconnectHeaders(client, 2, fork.Hash, replacement)
+	client.On("GetBlockHash", int64(2)).Return(&replacement, nil).Once()
+	client.On("GetBlockHash", int64(1)).Return(&fork.Hash, nil).Once()
+	client.On("GetBlockHeader", &fork.Hash).Return(
+		&wire.BlockHeader{Timestamp: fork.Timestamp}, nil,
+	).Once()
+	store.On("ListTxns", mock.Anything, db.ListTxnsQuery{
+		WalletID: 7, StartHeight: 2, EndHeight: math.MaxInt32,
+	}).Return([]db.TxInfo{
+		{
+			Block: &db.Block{Height: 2, Hash: chainhash.Hash{2}},
+		},
+	}, nil).Once()
+	store.On("DisconnectBlock", mock.Anything, uint32(7), observed, &fork,
+		map[uint32]*chainhash.Hash{
+			2: &replacement, 3: nil, observed.Height: nil,
+		},
+	).Return(nil).Once()
+
+	// Act: Process the queued observation through the real worker handler,
+	// carrying the complete proof and eligible fork to the atomic Store call.
+	err := s.processChainEvent(t.Context(), chainEvent{
+		notification: chain.BlockDisconnected(wtxmgr.BlockMeta{
+			Block: wtxmgr.Block{
+				Height: int32(observed.Height), Hash: observed.Hash,
+			},
+			Time: observed.Timestamp,
+		}),
+	})
+
+	// Assert: Recovery revokes readiness. Exact cleanup expectations reject
+	// missing proof, a higher fork, extra tail reads and duplicate native RPCs.
+	require.NoError(t, err)
+	require.Equal(t, syncStateSyncing, s.syncState())
+}
+
+// TestSyncerDisconnectProvesHigherCheckpoint includes a saved empty tip
+// above a lower observation when the source has shortened.
+func TestSyncerDisconnectProvesHigherCheckpoint(t *testing.T) {
+	t.Parallel()
+
+	// Arrange: The Wallet committed through three but receives only the
+	// disconnect for two. A source tip at one proves both higher rows absent.
+	store := &walletmock.Store{}
+	client := &bwmock.Chain{}
+	client.On("IsCurrent").Return(true).Once()
+	t.Cleanup(func() {
+		store.AssertExpectations(t)
+		client.AssertExpectations(t)
+	})
+
+	s := newTestSyncer(Config{Chain: client}, nil, nil, nil, store, 7)
+	s.state.Store(uint32(syncStateSynced))
+
+	fork := db.Block{
+		Height:    1,
+		Hash:      chainhash.Hash{1},
+		Timestamp: time.Unix(1, 0).UTC(),
+	}
+	tip := db.Block{Height: 3, Hash: chainhash.Hash{3}}
+	observed := db.Block{
+		Height: 2, Hash: chainhash.Hash{2},
+		Timestamp: time.Unix(2, 0).UTC(),
+	}
+
+	store.On("GetWallet", mock.Anything, s.cfg.Name).Return(
+		&db.WalletInfo{SyncedTo: &tip}, nil,
+	).Once()
+	client.On("GetBestBlock").Return(&fork.Hash, int32(1), nil).Twice()
+	store.On("ListSyncedBlocks", mock.Anything, db.ListSyncedBlocksQuery{
+		WalletID: 7, StartHeight: 0, EndHeight: 1,
+	}).Return([]db.Block{
+		{
+			Height: 0,
+		},
+		fork,
+	}, nil).Once()
+	client.On("GetBlockHash", int64(1)).Return(&fork.Hash, nil).Once()
+	client.On("GetBlockHeader", &fork.Hash).Return(
+		&wire.BlockHeader{Timestamp: fork.Timestamp}, nil,
+	).Once()
+	store.On("ListTxns", mock.Anything, db.ListTxnsQuery{
+		WalletID: 7, StartHeight: 2, EndHeight: math.MaxInt32,
+	}).Return([]db.TxInfo{
+		{
+			Block: &db.Block{Height: 2, Hash: chainhash.Hash{2}},
+		},
+	}, nil).Once()
+	store.On("DisconnectBlock", mock.Anything, uint32(7), observed, &fork,
+		map[uint32]*chainhash.Hash{
+			2: nil, 3: nil,
+		},
+	).Return(nil).Once()
+
+	// Act: Process the queued observation through the real worker handler,
+	// carrying the complete proof and eligible fork to the atomic Store call.
+	err := s.processChainEvent(t.Context(), chainEvent{
+		notification: chain.BlockDisconnected(wtxmgr.BlockMeta{
+			Block: wtxmgr.Block{
+				Height: int32(observed.Height), Hash: observed.Hash,
+			},
+			Time: observed.Timestamp,
+		}),
+	})
+
+	// Assert: Recovery revokes readiness. Exact cleanup expectations reject
+	// missing proof, a higher fork, extra tail reads and duplicate native RPCs.
+	require.NoError(t, err)
+	require.Equal(t, syncStateSyncing, s.syncState())
+}
+
 // linkedDisconnectHeaders builds real header identities from a given parent.
 // Distinct nonces model two valid branches sharing the same fork.
 func linkedDisconnectHeaders(parent chainhash.Hash, count int,
