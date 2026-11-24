@@ -82,79 +82,120 @@ func TestDisconnectBlockReconcilesMissingObservation(t *testing.T) {
 	require.NoError(t, err)
 }
 
-// TestRollbackToBlockAtomicRollsBackSyncTipOnFailure proves that
-// RollbackToBlock rewinds the wallet sync tip and rolls back transaction state
-// inside one backend transaction: when the rollback step fails, the sync-tip
-// rewind is discarded rather than committed on its own.
-//
-// The scenario forces a mid-rollback failure with a backend trigger that fails
-// block deletion. RollbackToBlock rewinds the wallet sync state to the fork
-// point, then fails while deleting block rows. Because both effects share one
-// transaction, the wallet's persisted sync tip must remain at its original
-// block.
-//
-// This test is non-tautological: a sync-state rewind committed in a separate
-// transaction from the block rollback would leave the wallet pointed below the
-// coinbase block even though the rollback failed, failing the final assertion.
-func TestRollbackToBlockAtomicRollsBackSyncTipOnFailure(t *testing.T) {
+// TestRollbackPreservesStateOnFailure checks that both rollback entry points
+// restore Wallet progress and transaction state if deleting the block fails.
+func TestRollbackPreservesStateOnFailure(t *testing.T) {
 	t.Parallel()
 
-	store := NewTestStore(t)
-	walletName := "wallet-rollback-atomic"
-	walletID := newWallet(t, store, walletName)
-	createDerivedAccount(t, store, walletID, db.KeyScopeBIP0084, "default")
-	queries := store.Queries()
+	// Each call needs a separate failing Store and its pre-write snapshots.
+	type fixture struct {
+		store  db.Store
+		fork   db.Block
+		wallet *db.WalletInfo
+		reward *db.TxInfo
+	}
 
-	addr := newDerivedAddress(
-		t, store, walletID, db.KeyScopeBIP0084, "default", false,
-	)
+	setup := func(t *testing.T) fixture {
+		t.Helper()
 
-	// The fork block survives the rollback; the sync tip would rewind to it.
-	forkBlock := CreateBlockFixture(t, queries, walletID, 419)
+		const name = "wallet-rollback-atomic"
 
-	// Confirm a coinbase transaction at the next block and point the wallet
-	// sync tip at it, so a successful rollback would visibly move the tip back
-	// to the fork block.
-	coinbaseBlock := CreateBlockFixture(t, queries, walletID, 420)
-	coinbaseTx := newCoinbaseTx(addr.ScriptPubKey)
-	err := store.CreateTx(t.Context(), db.CreateTxParams{
-		WalletID: walletID,
-		Tx:       coinbaseTx,
-		Received: time.Unix(1710004200, 0),
-		Block:    &coinbaseBlock,
-		Status:   db.TxStatusPublished,
-		Credits:  map[uint32]address.Address{0: nil},
+		ctx := t.Context()
+		store := NewTestStore(t)
+		id := newWallet(t, store, name)
+		createDerivedAccount(t, store, id, db.KeyScopeBIP0084, "default")
+		addr := newDerivedAddress(
+			t, store, id, db.KeyScopeBIP0084, "default", false,
+		)
+
+		// The trigger fires while removing the confirmed credit's block,
+		// after the transaction has attempted to rewind its references.
+		fork := CreateBlockFixture(t, store.Queries(), id, 419)
+		tip := CreateBlockFixture(t, store.Queries(), id, 420)
+		reward := newCoinbaseTx(addr.ScriptPubKey)
+		err := store.CreateTx(ctx, db.CreateTxParams{
+			WalletID: id,
+			Tx:       reward,
+			Received: time.Unix(1710004200, 0),
+			Block:    &tip,
+			Status:   db.TxStatusPublished,
+			Credits:  map[uint32]address.Address{0: nil},
+		})
+		require.NoError(t, err)
+		err = store.UpdateWallet(ctx, db.UpdateWalletParams{
+			WalletID: id, SyncedTo: &tip,
+		})
+		require.NoError(t, err)
+
+		before, err := store.GetWallet(ctx, name)
+		require.NoError(t, err)
+		tx, err := store.GetTx(ctx, db.GetTxQuery{
+			WalletID: id, Txid: reward.TxHash(),
+		})
+		require.NoError(t, err)
+		forceRollbackBlockDeleteFailure(t, store, id)
+
+		return fixture{
+			store:  store,
+			fork:   fork,
+			wallet: before,
+			reward: tx,
+		}
+	}
+
+	t.Run("RollbackToBlock", func(t *testing.T) {
+		t.Parallel()
+
+		// Arrange: Save the confirmed credit and checkpoint in a Store
+		// that will reject the final deletion of that checkpoint.
+		ctx := t.Context()
+		f := setup(t)
+
+		// Act: Request a height-based rollback of the confirmed block.
+		err := f.store.RollbackToBlock(
+			ctx, f.wallet.ID, f.wallet.SyncedTo.Height,
+		)
+
+		// Assert: Verify the injected error and read back both complete
+		// snapshots to catch a partially committed rollback.
+		requireDriverConstraintError(t, err, driverRollbackDeleteFailure)
+		require.ErrorContains(t, err, "forced rollback block delete failure")
+		after, err := f.store.GetWallet(ctx, f.wallet.Name)
+		require.NoError(t, err)
+		require.Equal(t, f.wallet, after)
+		tx, err := f.store.GetTx(ctx, db.GetTxQuery{
+			WalletID: f.wallet.ID, Txid: f.reward.Hash,
+		})
+		require.NoError(t, err)
+		require.Equal(t, f.reward, tx)
 	})
-	require.NoError(t, err)
 
-	err = store.UpdateWallet(t.Context(), db.UpdateWalletParams{
-		WalletID: walletID,
-		SyncedTo: &coinbaseBlock,
+	t.Run("DisconnectBlock", func(t *testing.T) {
+		t.Parallel()
+
+		// Arrange: Use a fresh checkpoint, its actual predecessor and
+		// a confirmed credit whose block deletion will fail.
+		ctx := t.Context()
+		f := setup(t)
+		tip := *f.wallet.SyncedTo
+
+		// Act: Deliver the native disconnect with proof of the missing tip.
+		err := f.store.DisconnectBlock(ctx, f.wallet.ID, tip, &f.fork,
+			map[uint32]*chainhash.Hash{tip.Height: nil})
+
+		// Assert: The delete trigger must have fired, and both snapshots
+		// must survive the failed selective disconnect transaction.
+		requireDriverConstraintError(t, err, driverRollbackDeleteFailure)
+		require.ErrorContains(t, err, "forced rollback block delete failure")
+		after, err := f.store.GetWallet(ctx, f.wallet.Name)
+		require.NoError(t, err)
+		require.Equal(t, f.wallet, after)
+		tx, err := f.store.GetTx(ctx, db.GetTxQuery{
+			WalletID: f.wallet.ID, Txid: f.reward.Hash,
+		})
+		require.NoError(t, err)
+		require.Equal(t, f.reward, tx)
 	})
-	require.NoError(t, err)
-
-	// Confirm the starting sync tip is the coinbase block.
-	before, err := store.GetWallet(t.Context(), walletName)
-	require.NoError(t, err)
-	require.NotNil(t, before.SyncedTo)
-	require.Equal(t, coinbaseBlock.Height, before.SyncedTo.Height)
-
-	// Force the block deletion stage to fail after rollback has rewound the
-	// wallet sync state inside the same transaction.
-	forceRollbackBlockDeleteFailure(t, store, walletID)
-
-	// The rollback (boundary = coinbase height) must fail while deleting the
-	// rollback block after rewinding the sync state to the fork point.
-	err = store.RollbackToBlock(t.Context(), walletID, coinbaseBlock.Height)
-	require.ErrorContains(t, err, "delete blocks at or above height")
-
-	// The sync tip must be unchanged: the failed rollback rolled the sync-tip
-	// rewind back with it, so the wallet still points at the coinbase block.
-	after, err := store.GetWallet(t.Context(), walletName)
-	require.NoError(t, err)
-	require.NotNil(t, after.SyncedTo)
-	require.Equal(t, coinbaseBlock.Height, after.SyncedTo.Height)
-	require.NotEqual(t, forkBlock.Height, after.SyncedTo.Height)
 }
 
 // TestRollbackToBlockRewindsSyncTipAndRollsBack proves the happy path: a
