@@ -1929,57 +1929,35 @@ func DisconnectBlockWithOps(ctx context.Context, walletID uint32, block Block,
 			block.Height, ErrInvalidParam)
 	}
 
-	// An observation the Wallet never retained or already removed
-	// has no owned history to rewind.
-	stored, err := ops.GetDisconnectBlock(ctx, block.Height)
-	if errors.Is(err, ErrBlockNotFound) {
+	// A current notification or a stored replacement cannot be orphaned.
+	if block.Hash.IsEqual(current) {
 		return nil
 	}
 
-	if err != nil {
+	// A missing empty notification can cover an earlier mined payment.
+	stored, err := ops.GetDisconnectBlock(ctx, block.Height)
+	if err != nil && !errors.Is(err, ErrBlockNotFound) {
 		return err
 	}
 
-	// A delayed event cannot rewind a replacement or a still-current block.
-	if stored.Hash != block.Hash || block.Hash.IsEqual(current) {
+	if stored != nil && stored.Hash != block.Hash {
 		return nil
 	}
 
-	// A height is enough to update the reference only after this transaction
-	// verifies that the Wallet still owns the fork used to collect the proof.
-	if previous != nil {
-		// A successor can exist in retained history. Accepting it as
-		// the fork would advance progress during a rewind.
-		if previous.Height >= block.Height {
-			return fmt.Errorf("disconnect fork %d must precede %d: %w",
-				previous.Height, block.Height, ErrInvalidParam)
-		}
-
-		fork, err := ops.GetDisconnectBlock(ctx, previous.Height)
-		if err != nil {
-			return err
-		}
-
-		if fork.Hash != previous.Hash {
-			return fmt.Errorf("disconnect fork at height %d: %w",
-				previous.Height, ErrBlockMismatch)
-		}
-	}
-
 	return disconnectStoredHistory(
-		ctx, walletID, block, previous, canonical, ops,
+		ctx, walletID, block.Height, stored, previous, canonical, ops,
 	)
 }
 
 // selectDisconnectHistory classifies each owned block identity once, so exact
 // deletion and coinbase descendant invalidation use the same orphan decision.
-func selectDisconnectHistory(walletID uint32, observed Block, blocks []Block,
+func selectDisconnectHistory(walletID uint32, blocks []Block,
 	history []DisconnectTx, canonical map[uint32]*chainhash.Hash) (
 	[]uint32, map[uint32][]chainhash.Hash, error) {
 
 	// Mined observations can lie outside committed progress. Their owned
 	// block join guarantees the same identity as any committed row here.
-	orphaned := map[uint32]chainhash.Hash{observed.Height: observed.Hash}
+	orphaned := make(map[uint32]chainhash.Hash)
 	for _, block := range blocks {
 		orphaned[block.Height] = block.Hash
 	}
@@ -2017,8 +1995,8 @@ func selectDisconnectHistory(walletID uint32, observed Block, blocks []Block,
 // disconnectStoredHistory validates all required evidence before writes. Its
 // saved-checkpoint bound includes orphaned progress above a lower notification.
 func disconnectStoredHistory(ctx context.Context, walletID uint32,
-	observed Block, previous *Block, canonical map[uint32]*chainhash.Hash,
-	ops DisconnectBlockOps) error {
+	observed uint32, stored, previous *Block,
+	canonical map[uint32]*chainhash.Hash, ops DisconnectBlockOps) error {
 
 	// The proven fork precedes the observation; nil means before genesis.
 	start := uint32(0)
@@ -2046,16 +2024,58 @@ func disconnectStoredHistory(ctx context.Context, walletID uint32,
 		return err
 	}
 
+	// An empty observed row may lie above scanned progress. Only an
+	// actual stored identity belongs in the set considered for deletion.
+	if stored != nil {
+		blocks = append(blocks, *stored)
+	}
+
 	heights, roots, err := selectDisconnectHistory(
-		walletID, observed, blocks, history, canonical,
+		walletID, blocks, history, canonical,
 	)
 	if err != nil {
 		return err
 	}
 
+	if len(heights) == 0 {
+		return nil
+	}
+
+	return rewindDisconnectHistory(
+		ctx, observed, previous, heights, roots, ops,
+	)
+}
+
+// rewindDisconnectHistory verifies the fork before moving references and
+// removing selected orphans and their descendants in the same transaction.
+func rewindDisconnectHistory(ctx context.Context, observed uint32,
+	previous *Block, heights []uint32, roots map[uint32][]chainhash.Hash,
+	ops DisconnectBlockOps) error {
+
+	// A height is enough to update the reference only after this transaction
+	// verifies that the Wallet still owns the fork used to collect the proof.
+	if previous != nil {
+		// A successor can exist in retained history. Accepting it as
+		// the fork would advance progress during a rewind.
+		if previous.Height >= observed {
+			return fmt.Errorf("disconnect fork %d must precede %d: %w",
+				previous.Height, observed, ErrInvalidParam)
+		}
+
+		fork, err := ops.GetDisconnectBlock(ctx, previous.Height)
+		if err != nil {
+			return err
+		}
+
+		if fork.Hash != previous.Hash {
+			return fmt.Errorf("disconnect fork at height %d: %w",
+				previous.Height, ErrBlockMismatch)
+		}
+	}
+
 	// References must move before any delete can fire confirmation triggers.
 	// All selected rows and their descendant effects share this same write.
-	err = ops.RewindDisconnectReferences(ctx, heights, previous)
+	err := ops.RewindDisconnectReferences(ctx, heights, previous)
 	if err != nil {
 		return err
 	}

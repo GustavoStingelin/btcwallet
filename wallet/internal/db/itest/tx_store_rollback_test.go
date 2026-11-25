@@ -7,10 +7,80 @@ import (
 	"time"
 
 	"github.com/btcsuite/btcd/address/v2"
+	"github.com/btcsuite/btcd/chainhash/v2"
 	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/btcsuite/btcwallet/wallet/internal/db"
 	"github.com/stretchr/testify/require"
 )
+
+// TestDisconnectBlockReconcilesMissingObservation verifies that an empty
+// disconnect can invalidate an older payment learned ahead of scan progress.
+func TestDisconnectBlockReconcilesMissingObservation(t *testing.T) {
+	t.Parallel()
+
+	// Arrange a scan through the fork and two later confirmed transactions.
+	// No payment or scan has created a row for the intervening notification.
+	ctx := t.Context()
+	store := NewTestStore(t)
+	id := newWallet(t, store, "sparse-disconnect")
+	fork, old := NewBlockFixture(1), NewBlockFixture(2)
+	missing, retained := NewBlockFixture(3), NewBlockFixture(4)
+	err := store.ApplyScanBatch(ctx, db.ScanBatchParams{
+		WalletID: id, SyncedBlocks: []db.Block{fork},
+	})
+	require.NoError(t, err)
+
+	payment := newRegularTx(
+		[]wire.OutPoint{{Hash: chainhash.Hash{19}}},
+		[]*wire.TxOut{wire.NewTxOut(100, nil)},
+	)
+	reward := newCoinbaseTx(nil)
+	err = store.ApplyTxBatch(ctx, db.TxBatchParams{
+		WalletID: id,
+		Transactions: []db.CreateTxParams{
+			{
+				WalletID: id, Tx: payment, Block: &old,
+				Received: old.Timestamp, Status: db.TxStatusPublished,
+			},
+			{
+				WalletID: id, Tx: reward, Block: &retained,
+				Received: retained.Timestamp, Status: db.TxStatusPublished,
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	// Act on just the missing notification. Its verified branch replaces
+	// the lower payment's block and still contains the higher reward.
+	replacement := old
+	replacement.Hash[0] ^= 0xff
+	err = store.DisconnectBlock(ctx, id, missing, &fork,
+		map[uint32]*chainhash.Hash{
+			old.Height:      &replacement.Hash,
+			missing.Height:  {23},
+			retained.Height: &retained.Hash,
+		})
+	require.NoError(t, err)
+
+	// Assert the abandoned confirmation disappeared, the reward stayed
+	// confirmed, and the scanner can commit the replacement identity.
+	tx, err := store.GetTx(ctx, db.GetTxQuery{
+		WalletID: id, Txid: payment.TxHash(),
+	})
+	require.NoError(t, err)
+	require.Nil(t, tx.Block)
+	tx, err = store.GetTx(ctx, db.GetTxQuery{
+		WalletID: id, Txid: reward.TxHash(),
+	})
+	require.NoError(t, err)
+	require.Equal(t, db.TxStatusPublished, tx.Status)
+	require.NotNil(t, tx.Block)
+	require.Equal(t, retained.Hash, tx.Block.Hash)
+	err = store.ApplyScanBatch(ctx, db.ScanBatchParams{
+		WalletID: id, SyncedBlocks: []db.Block{replacement},
+	})
+	require.NoError(t, err)
+}
 
 // TestRollbackToBlockAtomicRollsBackSyncTipOnFailure proves that
 // RollbackToBlock rewinds the wallet sync tip and rolls back transaction state
