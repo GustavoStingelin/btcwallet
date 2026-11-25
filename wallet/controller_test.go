@@ -2358,6 +2358,9 @@ func TestControllerTargetedScanFailureKeepsWorker(t *testing.T) {
 			Block: wtxmgr.Block{Hash: chainhash.Hash{101}, Height: 101},
 			Time:  time.Unix(1710004300, 0).UTC(),
 		}
+		deps.chain.On("GetBlockHeader", &block.Hash).Return(
+			&wire.BlockHeader{PrevBlock: tip.Hash}, nil,
+		).Once()
 		deps.store.On("ApplyTxBatch", mock.Anything, db.TxBatchParams{
 			WalletID:     w.id,
 			Transactions: []db.CreateTxParams{},

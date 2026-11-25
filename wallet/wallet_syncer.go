@@ -1060,6 +1060,18 @@ func (s *syncer) putBlockNotifications(ctx context.Context,
 	}
 
 	if blockMeta.Height == current.Height+1 {
+		// A dropped disconnect can leave our tip on a different branch.
+		// Verify the parent before this write replaces that checkpoint.
+		header, err := s.cfg.Chain.GetBlockHeader(&block.Hash)
+		if err != nil {
+			return fmt.Errorf("get live block header: %w", err)
+		}
+
+		if header.PrevBlock != current.Hash {
+			return fmt.Errorf("live block does not extend wallet "+
+				"checkpoint: %w", ErrStateChanged)
+		}
+
 		return s.applyStoreTxBatch(ctx, matches, block, block)
 	}
 
@@ -1071,11 +1083,12 @@ func (s *syncer) putBlockNotifications(ctx context.Context,
 
 	// Supplemental payloads may add effects only on the committed branch.
 	onBranch, err := s.blockMatchesCheckpoint(ctx, *block, current)
-	if err != nil || !onBranch {
-		return err
+	if onBranch {
+		return s.applyStoreTxBatch(ctx, matches, block, nil)
 	}
 
-	return s.applyStoreTxBatch(ctx, matches, block, nil)
+	// A stale or missing block has no effects. A failed lookup needs retry.
+	return err
 }
 
 // blockMatchesCheckpoint validates a supplemental payload against the saved
@@ -2064,8 +2077,8 @@ func (s *syncer) dispatchScanStrategy(ctx context.Context,
 // false if a sync operation was performed (or attempted) indicating that the
 // caller should continue polling.
 func (s *syncer) advanceChainSync(ctx context.Context) (bool, error) {
-	// Check the chain tip.
-	_, bestHeight, err := s.cfg.Chain.GetBestBlock()
+	// Compare the source tip with the durable Wallet checkpoint.
+	bestHash, bestHeight, err := s.cfg.Chain.GetBestBlock()
 	if err != nil {
 		// An error getting best block height means we couldn't
 		// determine sync status. We are NOT finished, and an error
@@ -2083,9 +2096,7 @@ func (s *syncer) advanceChainSync(ctx context.Context) (bool, error) {
 		return false, err
 	}
 
-	// If the wallet is caught up to the best known tip, log this and
-	// return.
-	if syncedTo.Height >= bestHeight {
+	if syncedTo.Height == bestHeight && syncedTo.Hash.IsEqual(bestHash) {
 		s.state.Store(uint32(syncStateSynced))
 		log.Infof("Wallet is synced to chain tip: height=%d",
 			syncedTo.Height)
@@ -2093,7 +2104,13 @@ func (s *syncer) advanceChainSync(ctx context.Context) (bool, error) {
 		return true, nil
 	}
 
-	// Calculate the gap.
+	// A missed disconnect can leave the checkpoint on an abandoned tip.
+	// Retry initialization so a current backend can establish the fork.
+	if syncedTo.Height >= bestHeight {
+		return false, fmt.Errorf("wallet checkpoint diverges from "+
+			"source tip: %w", ErrStateChanged)
+	}
+
 	gap := bestHeight - syncedTo.Height
 
 	// If the gap is large (> 6 blocks), we treat it as a major event

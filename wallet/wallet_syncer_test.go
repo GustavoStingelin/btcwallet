@@ -2450,11 +2450,12 @@ func TestProcessFilteredBlockBareMultisigCandidate(t *testing.T) {
 	// bare-multisig output.
 	const walletID uint32 = 11
 
+	source := &bwmock.Chain{}
 	store := &walletmock.Store{}
 	publisher := &mockTxPublisher{}
 	s := newTestSyncer(
-		Config{ChainParams: &chainParams}, nil, nil, publisher,
-		store, walletID,
+		Config{Chain: source, ChainParams: &chainParams}, nil, nil,
+		publisher, store, walletID,
 	)
 
 	members, pkScript := newBareMultisigScript(t)
@@ -2476,6 +2477,8 @@ func TestProcessFilteredBlockBareMultisigCandidate(t *testing.T) {
 	}
 
 	expectSyncedTip(store, waddrmgr.BlockStamp{Height: 101})
+	source.On("GetBlockHeader", &block.Hash).
+		Return(&wire.BlockHeader{}, nil).Once()
 	store.On("ApplyTxBatch", mock.Anything,
 		matchMultisigCandidateBatch(walletID, tx, members, block),
 	).Return(nil).Once()
@@ -2492,6 +2495,7 @@ func TestProcessFilteredBlockBareMultisigCandidate(t *testing.T) {
 	// Assert: The member credit candidates were written through the store batch
 	// API instead of being dropped.
 	require.NoError(t, err)
+	source.AssertExpectations(t)
 	store.AssertExpectations(t)
 }
 
@@ -2561,11 +2565,12 @@ func TestProcessFilteredBlockPassesCreditCandidates(t *testing.T) {
 	// relevant transaction pays two different output addresses.
 	const walletID uint32 = 13
 
+	source := &bwmock.Chain{}
 	store := &walletmock.Store{}
 	publisher := &mockTxPublisher{}
 	s := newTestSyncer(
-		Config{ChainParams: &chainParams}, nil, nil, publisher,
-		store, walletID,
+		Config{Chain: source, ChainParams: &chainParams}, nil, nil,
+		publisher, store, walletID,
 	)
 
 	firstAddr, err := address.NewAddressPubKeyHash(
@@ -2606,6 +2611,9 @@ func TestProcessFilteredBlockPassesCreditCandidates(t *testing.T) {
 		0: firstAddr,
 		1: secondAddr,
 	}
+
+	source.On("GetBlockHeader", &block.Hash).
+		Return(&wire.BlockHeader{}, nil).Once()
 	store.On("ApplyTxBatch", mock.Anything,
 		matchCandidateBatch(walletID, tx, wantCandidates, block),
 	).Return(nil).Once()
@@ -2622,6 +2630,7 @@ func TestProcessFilteredBlockPassesCreditCandidates(t *testing.T) {
 	// Assert: All output addresses were carried as candidates and left
 	// unresolved for the Store batch.
 	require.NoError(t, err)
+	source.AssertExpectations(t)
 	store.AssertExpectations(t)
 }
 
@@ -2635,11 +2644,12 @@ func TestProcessFilteredBlockUsesStore(t *testing.T) {
 	// wallet-owned transaction output.
 	const walletID uint32 = 9
 
+	source := &bwmock.Chain{}
 	store := &walletmock.Store{}
 	publisher := &mockTxPublisher{}
 	s := newTestSyncer(
-		Config{ChainParams: &chainParams}, nil, nil, publisher,
-		store, walletID,
+		Config{Chain: source, ChainParams: &chainParams}, nil, nil,
+		publisher, store, walletID,
 	)
 
 	addr, err := address.NewAddressPubKeyHash(
@@ -2669,6 +2679,8 @@ func TestProcessFilteredBlockUsesStore(t *testing.T) {
 	store.On("GetWallet", mock.Anything, s.cfg.Name).Return(
 		&db.WalletInfo{SyncedTo: &db.Block{Height: 100}}, nil,
 	).Once()
+	source.On("GetBlockHeader", &block.Hash).
+		Return(&wire.BlockHeader{}, nil).Once()
 	store.On("ApplyTxBatch", mock.Anything,
 		matchBlockTxBatch(walletID, tx, addr, received, block),
 	).Return(nil).Once()
@@ -2755,7 +2767,68 @@ func TestProcessFilteredBlockUsesStore(t *testing.T) {
 	// Assert: The older confirmed payload also leaves progress untouched;
 	// every exact read and transaction-only batch must have been consumed.
 	require.NoError(t, err)
+	source.AssertExpectations(t)
 	store.AssertExpectations(t)
+}
+
+// TestSyncerRejectsUnrelatedSuccessor verifies that a live block cannot
+// replace the checkpoint needed to recover from a missed disconnect.
+func TestSyncerRejectsUnrelatedSuccessor(t *testing.T) {
+	t.Parallel()
+
+	// Arrange a real checkpoint and a next-height block whose parent is
+	// its replacement. The Wallet missed the disconnect while busy.
+	ctx := t.Context()
+	store, _, id := newSQLScriptVault(t)
+
+	checkpoint := db.Block{
+		Height:    2,
+		Hash:      chainhash.Hash{2},
+		Timestamp: time.Unix(2, 0),
+	}
+	require.NoError(t, store.ApplyScanBatch(ctx, db.ScanBatchParams{
+		WalletID: id, SyncedBlocks: []db.Block{checkpoint},
+	}))
+
+	header := &wire.BlockHeader{
+		PrevBlock: chainhash.Hash{22},
+		Timestamp: time.Unix(3, 0),
+	}
+	block := wtxmgr.BlockMeta{
+		Block: wtxmgr.Block{Height: 3, Hash: header.BlockHash()},
+		Time:  header.Timestamp,
+	}
+
+	source := &bwmock.Chain{}
+	source.On("GetBlockHeader", &block.Hash).Return(header, nil).Once()
+
+	s := newTestSyncer(Config{
+		Name:  "sql-watch-only-scripts",
+		Chain: source,
+	}, nil, nil, nil, store, id)
+
+	events := make(chan any, 1)
+
+	s.events = events
+	events <- chain.FilteredBlockConnected{Block: &block}
+
+	// Act on the notification before the worker's next source-tip check.
+	err := s.waitForEvent(ctx)
+
+	// Assert recovery can still find the old tip and the unlinked block
+	// has neither advanced the checkpoint nor entered the Wallet history.
+	require.ErrorIs(t, err, ErrStateChanged)
+
+	info, err := store.GetWallet(ctx, s.cfg.Name)
+	require.NoError(t, err)
+	require.Equal(t, checkpoint.Hash, info.SyncedTo.Hash)
+	require.Equal(t, checkpoint.Height, info.SyncedTo.Height)
+
+	_, err = store.ListSyncedBlocks(ctx, db.ListSyncedBlocksQuery{
+		WalletID: id, StartHeight: 3, EndHeight: 3,
+	})
+	require.ErrorIs(t, err, db.ErrBlockNotFound)
+	source.AssertExpectations(t)
 }
 
 // TestProcessFilteredBlockOrder verifies that stale empty metadata, gaps and
@@ -7706,7 +7779,8 @@ func TestAdvanceChainSyncStoreSyncedTip(t *testing.T) {
 	t.Parallel()
 
 	// Arrange: a store-backed syncer whose Store reports a synced tip at
-	// the chain's best height.
+	// the chain's best height. Then switch the source to a different
+	// block at the same height without delivering a disconnect.
 	const walletID uint32 = 21
 
 	mockChain := &bwmock.Chain{}
@@ -7717,19 +7791,21 @@ func TestAdvanceChainSyncStoreSyncedTip(t *testing.T) {
 		store, walletID,
 	)
 
+	tip := chainhash.Hash{1}
+	mockChain.On("GetBestBlock").Return(&tip, int32(100), nil).Once()
 	mockChain.On("GetBestBlock").Return(
-		&chainhash.Hash{}, int32(100), nil,
+		&chainhash.Hash{2}, int32(100), nil,
 	).Once()
 	store.On("GetWallet", mock.Anything, "store-sync").Return(
 		&db.WalletInfo{
 			SyncedTo: &db.Block{
-				Hash:   chainhash.Hash{0x01},
+				Hash:   tip,
 				Height: 100,
 			},
 		}, nil,
-	).Once()
+	).Twice()
 
-	// Act: advance the chain sync.
+	// Act: check readiness while both tips still refer to the same block.
 	finished, err := s.advanceChainSync(t.Context())
 
 	// Assert: the store tip matched the chain tip, so we are synced and
@@ -7737,6 +7813,15 @@ func TestAdvanceChainSyncStoreSyncedTip(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, finished)
 	require.Equal(t, syncStateSynced, s.syncState())
+
+	// Act: check again after the branch switch while the durable tip is
+	// unchanged, as it would be after a missed disconnect.
+	finished, err = s.advanceChainSync(t.Context())
+
+	// Assert the worker can retry from the old checkpoint before it
+	// reports the replacement chain synced.
+	require.ErrorIs(t, err, ErrStateChanged)
+	require.False(t, finished)
 	store.AssertExpectations(t)
 	mockChain.AssertExpectations(t)
 }
