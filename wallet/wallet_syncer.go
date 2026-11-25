@@ -2941,11 +2941,8 @@ func (s *syncer) findCanonicalBlockHashes(ctx context.Context,
 	observed uint32, committedHeight int32,
 	fork, source waddrmgr.BlockStamp) (map[uint32]*chainhash.Hash, error) {
 
-	// Widen before adding one so a fork at MaxInt32 cannot overflow.
-	start, err := db.Int64ToUint32(int64(fork.Height) + 1)
-	if err != nil {
-		return nil, fmt.Errorf("disconnect history start: %w", err)
-	}
+	//nolint:gosec // The fork is -1 or a nonnegative int32.
+	start := uint32(int64(fork.Height) + 1)
 
 	tip, err := db.Int64ToUint32(int64(source.Height))
 	if err != nil {
