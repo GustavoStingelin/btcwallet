@@ -56,20 +56,14 @@ SELECT
     s.birthday_height,
     s.birthday_timestamp,
     s.updated_at,
-    b_synced.header_hash AS synced_block_hash,
+    b_synced.block_hash AS synced_block_hash,
     b_synced.block_timestamp AS synced_block_timestamp,
-    b_birthday.header_hash AS birthday_block_hash,
+    b_birthday.block_hash AS birthday_block_hash,
     b_birthday.block_timestamp AS birthday_block_timestamp
 FROM wallets AS w
 LEFT JOIN wallet_sync_states AS s ON w.id = s.wallet_id
-LEFT JOIN wallet_blocks AS b_synced
-    ON
-        s.synced_height = b_synced.block_height
-        AND s.wallet_id = b_synced.wallet_id
-LEFT JOIN wallet_blocks AS b_birthday
-    ON
-        s.birthday_height = b_birthday.block_height
-        AND s.wallet_id = b_birthday.wallet_id
+LEFT JOIN tree_blocks AS b_synced ON s.last_scanned_tree_block_id = b_synced.id
+LEFT JOIN tree_blocks AS b_birthday ON s.birthday_block_id = b_birthday.id
 WHERE w.id = $1
 `
 
@@ -124,20 +118,14 @@ SELECT
     s.birthday_height,
     s.birthday_timestamp,
     s.updated_at,
-    b_synced.header_hash AS synced_block_hash,
+    b_synced.block_hash AS synced_block_hash,
     b_synced.block_timestamp AS synced_block_timestamp,
-    b_birthday.header_hash AS birthday_block_hash,
+    b_birthday.block_hash AS birthday_block_hash,
     b_birthday.block_timestamp AS birthday_block_timestamp
 FROM wallets AS w
 LEFT JOIN wallet_sync_states AS s ON w.id = s.wallet_id
-LEFT JOIN wallet_blocks AS b_synced
-    ON
-        s.synced_height = b_synced.block_height
-        AND s.wallet_id = b_synced.wallet_id
-LEFT JOIN wallet_blocks AS b_birthday
-    ON
-        s.birthday_height = b_birthday.block_height
-        AND s.wallet_id = b_birthday.wallet_id
+LEFT JOIN tree_blocks AS b_synced ON s.last_scanned_tree_block_id = b_synced.id
+LEFT JOIN tree_blocks AS b_birthday ON s.birthday_block_id = b_birthday.id
 WHERE w.wallet_name = $1
 `
 
@@ -276,20 +264,14 @@ SELECT
     s.birthday_height,
     s.birthday_timestamp,
     s.updated_at,
-    b_synced.header_hash AS synced_block_hash,
+    b_synced.block_hash AS synced_block_hash,
     b_synced.block_timestamp AS synced_block_timestamp,
-    b_birthday.header_hash AS birthday_block_hash,
+    b_birthday.block_hash AS birthday_block_hash,
     b_birthday.block_timestamp AS birthday_block_timestamp
 FROM wallets AS w
 LEFT JOIN wallet_sync_states AS s ON w.id = s.wallet_id
-LEFT JOIN wallet_blocks AS b_synced
-    ON
-        s.synced_height = b_synced.block_height
-        AND s.wallet_id = b_synced.wallet_id
-LEFT JOIN wallet_blocks AS b_birthday
-    ON
-        s.birthday_height = b_birthday.block_height
-        AND s.wallet_id = b_birthday.wallet_id
+LEFT JOIN tree_blocks AS b_synced ON s.last_scanned_tree_block_id = b_synced.id
+LEFT JOIN tree_blocks AS b_birthday ON s.birthday_block_id = b_birthday.id
 WHERE (
     $1::BIGINT IS NULL
     OR w.id > $1::BIGINT
@@ -362,28 +344,45 @@ const RewindWalletReferencesForDisconnect = `-- name: RewindWalletReferencesForD
 UPDATE wallet_sync_states
 SET
     synced_height = CASE
-        WHEN synced_height >= $1::BIGINT THEN $2::INTEGER
+        WHEN last_scanned_tree_block_id = $1::BIGINT THEN $2::INTEGER
         ELSE synced_height
     END,
+    last_scanned_tree_block_id = CASE
+        WHEN last_scanned_tree_block_id = $1::BIGINT THEN $3::BIGINT
+        ELSE last_scanned_tree_block_id
+    END,
     birthday_height = CASE
-        WHEN birthday_height = $1::BIGINT THEN $2::INTEGER
+        WHEN birthday_block_id = $1::BIGINT THEN $2::INTEGER
         ELSE birthday_height
+    END,
+    birthday_block_id = CASE
+        WHEN birthday_block_id = $1::BIGINT THEN $3::BIGINT
+        ELSE birthday_block_id
     END,
     updated_at = current_timestamp AT TIME ZONE 'UTC'
 WHERE
-    wallet_id = $3::BIGINT
-    AND (synced_height >= $1::BIGINT OR birthday_height = $1::BIGINT)
+    wallet_id = $4::BIGINT
+    AND (
+        last_scanned_tree_block_id = $1::BIGINT
+        OR birthday_block_id = $1::BIGINT
+    )
 `
 
 type RewindWalletReferencesForDisconnectParams struct {
-	Height         int64
-	PreviousHeight sql.NullInt32
-	WalletID       int64
+	OrphanID        int64
+	PreviousHeight  sql.NullInt32
+	PreviousBlockID sql.NullInt64
+	WalletID        int64
 }
 
 // Rewind scanned progress across removed history; move birthday only on removal.
 func (q *Queries) RewindWalletReferencesForDisconnect(ctx context.Context, arg RewindWalletReferencesForDisconnectParams) (int64, error) {
-	result, err := q.db.Exec(ctx, RewindWalletReferencesForDisconnect, arg.Height, arg.PreviousHeight, arg.WalletID)
+	result, err := q.db.Exec(ctx, RewindWalletReferencesForDisconnect,
+		arg.OrphanID,
+		arg.PreviousHeight,
+		arg.PreviousBlockID,
+		arg.WalletID,
+	)
 	if err != nil {
 		return 0, err
 	}
@@ -427,12 +426,14 @@ UPDATE wallet_sync_states
 SET
     -- If synced_height param is NOT NULL, use it. Otherwise, keep existing value.
     synced_height = coalesce($2, synced_height),
+    last_scanned_tree_block_id = coalesce($3, last_scanned_tree_block_id),
 
     -- If birthday_height param is NOT NULL, use it. Otherwise, keep existing value.
-    birthday_height = coalesce($3, birthday_height),
+    birthday_height = coalesce($4, birthday_height),
+    birthday_block_id = coalesce($5, birthday_block_id),
 
     -- If birthday_timestamp param is NOT NULL, use it. Otherwise, keep existing value.
-    birthday_timestamp = coalesce($4, birthday_timestamp),
+    birthday_timestamp = coalesce($6, birthday_timestamp),
 
     -- Always update timestamp to current database time in UTC.
     updated_at = current_timestamp AT TIME ZONE 'UTC'
@@ -443,7 +444,9 @@ WHERE
 type UpdateWalletSyncStateParams struct {
 	WalletID          int64
 	SyncedHeight      sql.NullInt32
+	SyncedBlockID     sql.NullInt64
 	BirthdayHeight    sql.NullInt32
+	BirthdayBlockID   sql.NullInt64
 	BirthdayTimestamp sql.NullTime
 }
 
@@ -451,7 +454,9 @@ func (q *Queries) UpdateWalletSyncState(ctx context.Context, arg UpdateWalletSyn
 	result, err := q.db.Exec(ctx, UpdateWalletSyncState,
 		arg.WalletID,
 		arg.SyncedHeight,
+		arg.SyncedBlockID,
 		arg.BirthdayHeight,
+		arg.BirthdayBlockID,
 		arg.BirthdayTimestamp,
 	)
 	if err != nil {

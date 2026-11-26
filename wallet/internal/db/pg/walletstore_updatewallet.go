@@ -43,7 +43,7 @@ func (o updateWalletOps) EnsureBlock(ctx context.Context,
 func (o updateWalletOps) UpdateWalletSyncState(ctx context.Context,
 	params db.UpdateWalletParams) error {
 
-	syncParams, err := buildUpdateSyncParams(params)
+	syncParams, err := buildUpdateSyncParams(ctx, o.q, params)
 	if err != nil {
 		return err
 	}
@@ -63,7 +63,8 @@ func (o updateWalletOps) UpdateWalletSyncState(ctx context.Context,
 
 // buildUpdateSyncParams constructs the UpdateWalletSyncStateParams from
 // the given UpdateWalletParams.
-func buildUpdateSyncParams(params db.UpdateWalletParams) (
+func buildUpdateSyncParams(ctx context.Context, q *sqlc.Queries,
+	params db.UpdateWalletParams) (
 	sqlc.UpdateWalletSyncStateParams, error) {
 
 	syncParams := sqlc.UpdateWalletSyncStateParams{
@@ -77,6 +78,18 @@ func buildUpdateSyncParams(params db.UpdateWalletParams) (
 		}
 
 		syncParams.SyncedHeight = syncedHeight
+
+		id, err := requireBlockMatches(ctx, q, params.SyncedTo)
+		if err != nil {
+			return syncParams, err
+		}
+
+		err = linkNextSyncedBlock(ctx, q, params.WalletID, params.SyncedTo, id)
+		if err != nil {
+			return syncParams, err
+		}
+
+		syncParams.SyncedBlockID = sql.NullInt64{Int64: id, Valid: true}
 	}
 
 	if params.Birthday != nil {
@@ -95,6 +108,13 @@ func buildUpdateSyncParams(params db.UpdateWalletParams) (
 		}
 
 		syncParams.BirthdayHeight = birthdayHeight
+
+		id, err := requireBlockMatches(ctx, q, params.BirthdayBlock)
+		if err != nil {
+			return syncParams, err
+		}
+
+		syncParams.BirthdayBlockID = sql.NullInt64{Int64: id, Valid: true}
 	}
 
 	return syncParams, nil

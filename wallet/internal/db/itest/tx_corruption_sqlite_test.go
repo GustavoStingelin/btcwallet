@@ -109,7 +109,9 @@ func forceRollbackBlockDeleteFailure(t *testing.T, store *sqlite.Store,
 	_, err := store.DB().ExecContext(
 		t.Context(),
 		fmt.Sprintf("CREATE TRIGGER fail_rollback_block_delete "+
-			"BEFORE DELETE ON wallet_blocks WHEN old.wallet_id = %d "+
+			"BEFORE UPDATE OF block_height ON transactions "+
+			"WHEN old.wallet_id = %d AND old.block_height IS NOT NULL "+
+			"AND new.block_height IS NULL "+
 			"BEGIN SELECT RAISE(FAIL, "+
 			"'forced rollback block delete failure'); END", walletID),
 	)
@@ -138,23 +140,23 @@ func corruptTransactionBlockHeight(t *testing.T, store *sqlite.Store,
 	require.NoError(t, err)
 
 	blockHash := RandomHash()
-	_, err = tx.ExecContext(
+
+	var blockID int64
+
+	err = tx.QueryRowContext(
 		t.Context(),
-		"INSERT INTO wallet_blocks "+
-			"(wallet_id, block_height, header_hash, block_timestamp) "+
-			"VALUES (?, ?, ?, ?) "+
-			"ON CONFLICT(wallet_id, block_height) DO UPDATE SET "+
-			"header_hash = excluded.header_hash, "+
-			"block_timestamp = excluded.block_timestamp",
-		int64(walletID), height, blockHash[:], time.Now().Unix(),
-	)
+		"INSERT INTO tree_blocks "+
+			"(block_height, block_hash, block_timestamp) "+
+			"VALUES (?, ?, ?) RETURNING id",
+		height, blockHash[:], time.Now().Unix(),
+	).Scan(&blockID)
 	require.NoError(t, err)
 
 	result, err := tx.ExecContext(
 		t.Context(),
-		"UPDATE transactions SET block_height = ? "+
+		"UPDATE transactions SET block_height = ?, tree_block_id = ? "+
 			"WHERE wallet_id = ? AND tx_hash = ?",
-		height, int64(walletID), txHash[:],
+		height, blockID, int64(walletID), txHash[:],
 	)
 	require.NoError(t, err)
 

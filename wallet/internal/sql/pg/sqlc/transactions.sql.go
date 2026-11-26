@@ -12,7 +12,12 @@ import (
 )
 
 const DeleteBlocksAtOrAboveHeight = `-- name: DeleteBlocksAtOrAboveHeight :execrows
-DELETE FROM wallet_blocks
+UPDATE transactions
+SET
+    block_height = NULL,
+    tree_block_id = NULL,
+    confirmed_order = NULL,
+    tx_status = CASE WHEN is_coinbase THEN 4 ELSE tx_status END
 WHERE
     wallet_id = $1::BIGINT
     AND block_height >= $2::INTEGER
@@ -23,15 +28,7 @@ type DeleteBlocksAtOrAboveHeightParams struct {
 	RollbackHeight int32
 }
 
-// Deletes blocks at and after the provided height.
-//
-// How:
-//   - Deletes only the owning Wallet range in wallet_blocks.
-//   - Relies on FK/trigger side effects to null transaction block references and
-//     orphan coinbase rows.
-//
-// Performance:
-// - Executes as a range delete over the block-height primary key.
+// Explicit height rollback detaches Wallet confirmations, not shared blocks.
 func (q *Queries) DeleteBlocksAtOrAboveHeight(ctx context.Context, arg DeleteBlocksAtOrAboveHeightParams) (int64, error) {
 	result, err := q.db.Exec(ctx, DeleteBlocksAtOrAboveHeight, arg.WalletID, arg.RollbackHeight)
 	if err != nil {
@@ -114,16 +111,13 @@ SELECT
     t.raw_tx,
     t.received_time,
     t.block_height,
-    b.header_hash AS block_hash,
+    b.block_hash,
     b.block_timestamp,
     t.is_coinbase,
     t.tx_status,
     t.tx_label
 FROM transactions AS t
-LEFT JOIN wallet_blocks AS b
-    ON
-        t.block_height = b.block_height
-        AND t.wallet_id = b.wallet_id
+LEFT JOIN tree_blocks AS b ON t.tree_block_id = b.id
 WHERE t.wallet_id = $1 AND t.tx_hash = $2
 `
 
@@ -224,6 +218,7 @@ INSERT INTO transactions (
     tx_hash,
     raw_tx,
     block_height,
+    tree_block_id,
     confirmed_order,
     tx_status,
     received_time,
@@ -234,14 +229,15 @@ INSERT INTO transactions (
     $2,
     $3,
     $4::INTEGER,
+    $5,
     CASE
         WHEN $4::INTEGER IS NULL THEN NULL
         ELSE nextval('transactions_confirmed_order_seq')
     END,
-    $5,
     $6,
     $7,
-    $8
+    $8,
+    $9
 )
 RETURNING id
 `
@@ -251,6 +247,7 @@ type InsertTransactionParams struct {
 	TxHash       []byte
 	RawTx        []byte
 	BlockHeight  sql.NullInt32
+	BlockID      sql.NullInt64
 	TxStatus     int16
 	ReceivedTime time.Time
 	IsCoinbase   bool
@@ -275,6 +272,7 @@ func (q *Queries) InsertTransaction(ctx context.Context, arg InsertTransactionPa
 		arg.TxHash,
 		arg.RawTx,
 		arg.BlockHeight,
+		arg.BlockID,
 		arg.TxStatus,
 		arg.ReceivedTime,
 		arg.IsCoinbase,
@@ -463,16 +461,13 @@ SELECT
     t.raw_tx,
     t.received_time,
     t.block_height,
-    b.header_hash AS block_hash,
+    b.block_hash,
     b.block_timestamp,
     t.is_coinbase,
     t.tx_status,
     t.tx_label
 FROM transactions AS t
-INNER JOIN wallet_blocks AS b
-    ON
-        t.block_height = b.block_height
-        AND t.wallet_id = b.wallet_id
+INNER JOIN tree_blocks AS b ON t.tree_block_id = b.id
 WHERE
     t.wallet_id = $1
     AND t.block_height BETWEEN
@@ -700,34 +695,28 @@ const RewindWalletSyncStateHeightsForRollback = `-- name: RewindWalletSyncStateH
 UPDATE wallet_sync_states
 SET
     synced_height = CASE
-        WHEN
-            synced_height IS NOT NULL
-            AND synced_height >= $1::INTEGER
-            THEN (
-                SELECT max(block_height)::INTEGER
-                FROM wallet_blocks
-                WHERE
-                    wallet_id = $2::BIGINT
-                    AND block_height < $1::INTEGER
-            )
+        WHEN synced_height >= $1::INTEGER
+            THEN $2::INTEGER
         ELSE synced_height
     END,
+    last_scanned_tree_block_id = CASE
+        WHEN synced_height >= $1::INTEGER
+            THEN $3::BIGINT
+        ELSE last_scanned_tree_block_id
+    END,
     birthday_height = CASE
-        WHEN
-            birthday_height IS NOT NULL
-            AND birthday_height >= $1::INTEGER
-            THEN (
-                SELECT max(block_height)::INTEGER
-                FROM wallet_blocks
-                WHERE
-                    wallet_id = $2::BIGINT
-                    AND block_height < $1::INTEGER
-            )
+        WHEN birthday_height >= $1::INTEGER
+            THEN $2::INTEGER
         ELSE birthday_height
+    END,
+    birthday_block_id = CASE
+        WHEN birthday_height >= $1::INTEGER
+            THEN $3::BIGINT
+        ELSE birthday_block_id
     END,
     updated_at = current_timestamp AT TIME ZONE 'UTC'
 WHERE
-    wallet_id = $2::BIGINT
+    wallet_id = $4::BIGINT
     AND (
         (
             synced_height IS NOT NULL
@@ -741,27 +730,20 @@ WHERE
 `
 
 type RewindWalletSyncStateHeightsForRollbackParams struct {
-	RollbackHeight int32
-	WalletID       int64
+	RollbackHeight  int32
+	PreviousHeight  sql.NullInt32
+	PreviousBlockID sql.NullInt64
+	WalletID        int64
 }
 
-// Rewrites wallet sync-state heights so they stop referencing blocks that are
-// about to be deleted during RollbackToBlock.
-//
-// How:
-//   - Computes the greatest stored block below the rollback boundary.
-//   - Rewrites both synced_height and birthday_height in one statement so the
-//     subsequent block delete does not violate `ON DELETE RESTRICT`.
-//   - Example: if `rollback_height = 195`, affected sync heights rewind to the
-//     greatest stored block below 195, not necessarily 194 on sparse block tables.
-//   - If there is no stored block below the boundary, the sync state no longer
-//     points at any surviving block row.
-//
-// Performance:
-//   - Touches only wallet_sync_states rows whose heights are at or above the
-//     rollback boundary.
+// Move affected references to the caller-selected retained Wallet block.
 func (q *Queries) RewindWalletSyncStateHeightsForRollback(ctx context.Context, arg RewindWalletSyncStateHeightsForRollbackParams) (int64, error) {
-	result, err := q.db.Exec(ctx, RewindWalletSyncStateHeightsForRollback, arg.RollbackHeight, arg.WalletID)
+	result, err := q.db.Exec(ctx, RewindWalletSyncStateHeightsForRollback,
+		arg.RollbackHeight,
+		arg.PreviousHeight,
+		arg.PreviousBlockID,
+		arg.WalletID,
+	)
 	if err != nil {
 		return 0, err
 	}
@@ -805,20 +787,22 @@ SET
     confirmed_order = CASE
         WHEN $1::INTEGER IS NULL THEN NULL
         WHEN
-            block_height = $1::INTEGER
+            tree_block_id = $2
             AND confirmed_order IS NOT NULL
             THEN confirmed_order
         ELSE nextval('transactions_confirmed_order_seq')
     END,
     block_height = $1::INTEGER,
-    tx_status = $2
+    tree_block_id = $2,
+    tx_status = $3
 WHERE
-    wallet_id = $3
-    AND tx_hash = $4
+    wallet_id = $4
+    AND tx_hash = $5
 `
 
 type UpdateTransactionStateByHashParams struct {
 	BlockHeight sql.NullInt32
+	BlockID     sql.NullInt64
 	Status      int16
 	WalletID    int64
 	TxHash      []byte
@@ -840,6 +824,7 @@ type UpdateTransactionStateByHashParams struct {
 func (q *Queries) UpdateTransactionStateByHash(ctx context.Context, arg UpdateTransactionStateByHashParams) (int64, error) {
 	result, err := q.db.Exec(ctx, UpdateTransactionStateByHash,
 		arg.BlockHeight,
+		arg.BlockID,
 		arg.Status,
 		arg.WalletID,
 		arg.TxHash,

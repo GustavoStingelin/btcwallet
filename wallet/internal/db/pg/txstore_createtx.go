@@ -49,6 +49,7 @@ type createTxOps struct {
 	invalidateUnminedTxOps
 
 	blockHeight sql.NullInt32
+	blockID     sql.NullInt64
 }
 
 var _ db.CreateTxOps = (*createTxOps)(nil)
@@ -120,16 +121,20 @@ func (o *createTxOps) ConfirmExisting(ctx context.Context,
 	req db.CreateTxRequest,
 	_ db.CreateTxExistingTarget) error {
 
-	blockHeight, err := requireBlockMatches(
-		ctx, o.qtx, req.Params.WalletID, req.Params.Block,
-	)
+	blockID, err := requireBlockMatches(ctx, o.qtx, req.Params.Block)
 	if err != nil {
 		return fmt.Errorf("require confirming block: %w", err)
 	}
 
+	height, err := db.Uint32ToNullInt32(req.Params.Block.Height)
+	if err != nil {
+		return err
+	}
+
 	rows, err := o.qtx.UpdateTransactionStateByHash(
 		ctx, sqlc.UpdateTransactionStateByHashParams{
-			BlockHeight: sql.NullInt32{Int32: blockHeight, Valid: true},
+			BlockHeight: height,
+			BlockID:     sql.NullInt64{Int64: blockID, Valid: true},
 			Status:      int16(db.TxStatusPublished),
 			WalletID:    int64(req.Params.WalletID),
 			TxHash:      req.TxHash[:],
@@ -152,19 +157,24 @@ func (o *createTxOps) PrepareBlock(ctx context.Context,
 	req db.CreateTxRequest) error {
 
 	o.blockHeight = sql.NullInt32{}
+	o.blockID = sql.NullInt64{}
 
 	if req.Params.Block == nil {
 		return nil
 	}
 
-	height, err := requireBlockMatches(
-		ctx, o.qtx, req.Params.WalletID, req.Params.Block,
-	)
+	id, err := requireBlockMatches(ctx, o.qtx, req.Params.Block)
 	if err != nil {
 		return err
 	}
 
-	o.blockHeight = sql.NullInt32{Int32: height, Valid: true}
+	height, err := db.Uint32ToNullInt32(req.Params.Block.Height)
+	if err != nil {
+		return err
+	}
+
+	o.blockHeight = height
+	o.blockID = sql.NullInt64{Int64: id, Valid: true}
 
 	return nil
 }
@@ -208,6 +218,7 @@ func (o *createTxOps) Insert(ctx context.Context,
 		TxHash:       req.TxHash[:],
 		RawTx:        req.RawTx,
 		BlockHeight:  o.blockHeight,
+		BlockID:      o.blockID,
 		TxStatus:     int16(req.Params.Status),
 		ReceivedTime: req.Received,
 		IsCoinbase:   req.IsCoinbase,

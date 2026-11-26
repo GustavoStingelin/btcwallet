@@ -3,7 +3,6 @@ package pg
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 
 	"github.com/btcsuite/btcd/chainhash/v2"
@@ -12,6 +11,38 @@ import (
 )
 
 const maxSQLBlockHeight = int32(1<<31 - 1)
+
+// ListAheadConfirmationHeights returns heights requiring separate source proof.
+func (s *Store) ListAheadConfirmationHeights(ctx context.Context,
+	walletID uint32, checkpointHeight int32) ([]uint32, error) {
+
+	var heights []uint32
+
+	err := s.execRead(ctx, func(q *sqlc.Queries) error {
+		rows, err := q.ListAheadConfirmationHeights(
+			ctx, sqlc.ListAheadConfirmationHeightsParams{
+				WalletID:    int64(walletID),
+				FloorHeight: checkpointHeight,
+			},
+		)
+		if err != nil {
+			return err
+		}
+
+		for _, row := range rows {
+			height, err := db.Int64ToUint32(row)
+			if err != nil {
+				return err
+			}
+
+			heights = append(heights, height)
+		}
+
+		return nil
+	})
+
+	return heights, err
+}
 
 // RewindWallet atomically rewinds one wallet for a manual rescan without
 // deleting shared block rows or mutating other wallets' sync states.
@@ -153,6 +184,23 @@ type rollbackToBlockOps struct {
 	walletID uint32
 }
 
+// ReconcileAheadConfirmations detaches stale sparse observations on startup.
+func (s *Store) ReconcileAheadConfirmations(ctx context.Context, walletID,
+	start uint32, canonical map[uint32]*chainhash.Hash) error {
+
+	return s.execWrite(ctx, func(q *sqlc.Queries) error {
+		err := lockTxGraph(ctx, q, int64(walletID))
+		if err != nil {
+			return err
+		}
+
+		return db.ReconcileAheadConfirmationsWithOps(
+			ctx, walletID, start, canonical,
+			rollbackToBlockOps{qtx: q, walletID: walletID},
+		)
+	})
+}
+
 var _ db.RollbackToBlockOps = (*rollbackToBlockOps)(nil)
 
 var _ db.DisconnectBlockOps = (*rollbackToBlockOps)(nil)
@@ -197,11 +245,35 @@ func (o rollbackToBlockOps) RewindWalletSyncStateHeights(
 		return fmt.Errorf("convert rollback height: %w", err)
 	}
 
-	_, err = o.qtx.RewindWalletSyncStateHeightsForRollback(
-		ctx, sqlc.RewindWalletSyncStateHeightsForRollbackParams{
-			WalletID: int64(o.walletID), RollbackHeight: rollbackHeight,
-		},
-	)
+	params := sqlc.RewindWalletSyncStateHeightsForRollbackParams{
+		WalletID: int64(o.walletID), RollbackHeight: rollbackHeight,
+	}
+	if rollbackHeight != 0 {
+		rows, err := o.qtx.GetWalletBlocksInRange(
+			ctx, sqlc.GetWalletBlocksInRangeParams{
+				WalletID: int64(o.walletID), EndHeight: rollbackHeight - 1,
+			},
+		)
+		if err != nil {
+			return fmt.Errorf("find rollback ancestor: %w", err)
+		}
+
+		if len(rows) > 0 {
+			ancestor := rows[len(rows)-1]
+
+			row, err := o.qtx.TreeBlockByHash(ctx, ancestor.HeaderHash)
+			if err != nil {
+				return fmt.Errorf("read rollback ancestor: %w", err)
+			}
+
+			params.PreviousHeight = sql.NullInt32{
+				Int32: ancestor.BlockHeight, Valid: true,
+			}
+			params.PreviousBlockID = sql.NullInt64{Int64: row.ID, Valid: true}
+		}
+	}
+
+	_, err = o.qtx.RewindWalletSyncStateHeightsForRollback(ctx, params)
 	if err != nil {
 		return fmt.Errorf("rewind wallet sync state heights query: %w", err)
 	}
@@ -328,25 +400,16 @@ func groupRollbackCoinbaseRoots(rows []sqlc.ListRollbackCoinbaseRootsRow) (
 func (o rollbackToBlockOps) GetDisconnectBlock(ctx context.Context,
 	height uint32) (*db.Block, error) {
 
-	h, err := db.Uint32ToInt32(height)
-	if err != nil {
-		return nil, err
-	}
-
-	row, err := o.qtx.GetWalletBlockByHeight(
-		ctx, sqlc.GetWalletBlockByHeightParams{
-			WalletID: int64(o.walletID), BlockHeight: h,
-		},
-	)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, db.ErrBlockNotFound
-	}
-
+	rows, err := o.ListDisconnectBlocks(ctx, height, height)
 	if err != nil {
 		return nil, fmt.Errorf("get disconnected block: %w", err)
 	}
 
-	return db.BuildBlock(row.HeaderHash, height, row.BlockTimestamp)
+	if len(rows) == 0 {
+		return nil, db.ErrBlockNotFound
+	}
+
+	return &rows[0], nil
 }
 
 // GetDisconnectCheckpoint reads progress within the existing atomic write.
@@ -465,9 +528,13 @@ func (o rollbackToBlockOps) ListDisconnectTransactions(ctx context.Context,
 // RewindDisconnectReferences applies the shared workflow's selected rewinds.
 // Normalize the fork once; SQL rewinds progress across any removed history.
 func (o rollbackToBlockOps) RewindDisconnectReferences(ctx context.Context,
-	heights []uint32, previous *db.Block) error {
+	orphaned []db.Block, previous *db.Block) error {
 
-	var fork sql.NullInt32
+	var (
+		fork   sql.NullInt32
+		forkID sql.NullInt64
+	)
+
 	if previous != nil {
 		height, err := db.Uint32ToInt32(previous.Height)
 		if err != nil {
@@ -475,13 +542,25 @@ func (o rollbackToBlockOps) RewindDisconnectReferences(ctx context.Context,
 		}
 
 		fork = sql.NullInt32{Int32: height, Valid: true}
+
+		id, err := requireBlockMatches(ctx, o.qtx, previous)
+		if err != nil {
+			return err
+		}
+
+		forkID = sql.NullInt64{Int64: id, Valid: true}
 	}
 
-	for _, height := range heights {
-		_, err := o.qtx.RewindWalletReferencesForDisconnect(
+	for _, block := range orphaned {
+		row, err := o.qtx.TreeBlockByHash(ctx, block.Hash[:])
+		if err != nil {
+			return fmt.Errorf("resolve orphaned block: %w", err)
+		}
+
+		_, err = o.qtx.RewindWalletReferencesForDisconnect(
 			ctx, sqlc.RewindWalletReferencesForDisconnectParams{
-				WalletID: int64(o.walletID), Height: int64(height),
-				PreviousHeight: fork,
+				WalletID: int64(o.walletID), OrphanID: row.ID,
+				PreviousHeight: fork, PreviousBlockID: forkID,
 			},
 		)
 		if err != nil {
@@ -492,19 +571,24 @@ func (o rollbackToBlockOps) RewindDisconnectReferences(ctx context.Context,
 	return nil
 }
 
-// DeleteDisconnectBlocks removes only rows selected by shared recovery policy.
-// The shared workflow has already moved every affected reference in this write.
-func (o rollbackToBlockOps) DeleteDisconnectBlocks(ctx context.Context,
-	heights []uint32) error {
+// DetachDisconnectBlocks leaves shared rows and sibling Wallets untouched.
+func (o rollbackToBlockOps) DetachDisconnectBlocks(ctx context.Context,
+	orphaned []db.Block) error {
 
-	for _, height := range heights {
-		_, err := o.qtx.DeleteWalletBlockByHeight(
-			ctx, sqlc.DeleteWalletBlockByHeightParams{
-				WalletID: int64(o.walletID), BlockHeight: int64(height),
+	for _, block := range orphaned {
+		row, err := o.qtx.TreeBlockByHash(ctx, block.Hash[:])
+		if err != nil {
+			return fmt.Errorf("resolve orphaned block: %w", err)
+		}
+
+		err = o.qtx.DetachTreeConfirmations(
+			ctx, sqlc.DetachTreeConfirmationsParams{
+				WalletID: int64(o.walletID),
+				BlockID:  sql.NullInt64{Int64: row.ID, Valid: true},
 			},
 		)
 		if err != nil {
-			return fmt.Errorf("delete disconnected block: %w", err)
+			return fmt.Errorf("detach disconnected confirmations: %w", err)
 		}
 	}
 

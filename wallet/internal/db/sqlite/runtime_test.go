@@ -146,8 +146,8 @@ func TestListSyncedBlocksReadsStoredBlock(t *testing.T) {
 		Height:    144,
 		Timestamp: time.Unix(1710003500, 0),
 	}
-	err = store.execWrite(t.Context(), func(qtx *sqlc.Queries) error {
-		return ensureBlockExists(t.Context(), qtx, wallet.ID, block)
+	err = store.UpdateWallet(t.Context(), db.UpdateWalletParams{
+		WalletID: wallet.ID, SyncedTo: block,
 	})
 	require.NoError(t, err)
 
@@ -164,7 +164,7 @@ func TestListSyncedBlocksReadsStoredBlock(t *testing.T) {
 }
 
 // TestEnsureBlockExistsRejectsConflictingBlock verifies that insert-or-ignore
-// block writes still reject a same-height block with different metadata.
+// block writes still reject conflicting metadata for the same hash.
 func TestEnsureBlockExistsRejectsConflictingBlock(t *testing.T) {
 	t.Parallel()
 
@@ -183,8 +183,8 @@ func TestEnsureBlockExistsRejectsConflictingBlock(t *testing.T) {
 		Timestamp: time.Unix(1710003500, 0),
 	}
 	conflict := &db.Block{
-		Hash:      chainhash.Hash{10, 9, 8},
-		Height:    block.Height,
+		Hash:      block.Hash,
+		Height:    block.Height + 1,
 		Timestamp: block.Timestamp,
 	}
 	err = store.execWrite(t.Context(), func(qtx *sqlc.Queries) error {

@@ -599,6 +599,20 @@ func (m *Store) DisconnectBlock(ctx context.Context, walletID uint32,
 	return args.Error(0)
 }
 
+// ListAheadConfirmationHeights defaults to no observations in sync fixtures.
+func (m *Store) ListAheadConfirmationHeights(context.Context, uint32,
+	int32) ([]uint32, error) {
+
+	return nil, nil
+}
+
+// ReconcileAheadConfirmations records the worker's sparse recovery request.
+func (m *Store) ReconcileAheadConfirmations(ctx context.Context,
+	walletID, start uint32, canonical map[uint32]*chainhash.Hash) error {
+
+	return m.Called(ctx, walletID, start, canonical).Error(0)
+}
+
 // GetKeyScopeSchema records the admission read so tests can forbid secret
 // preparation and mutation when a scope assertion fails.
 func (m *Store) GetKeyScopeSchema(ctx context.Context, walletID uint32,

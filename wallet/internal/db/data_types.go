@@ -261,6 +261,10 @@ type Block struct {
 	// Timestamp is the UTC timestamp of the block, which is used for
 	// wallet synchronization and rescan operations.
 	Timestamp time.Time
+
+	// ParentHash is supplied on scan progress writes from a verified header.
+	// A zero hash means no parent evidence is supplied.
+	ParentHash chainhash.Hash
 }
 
 // ListWalletsQuery contains the parameters for listing wallets.

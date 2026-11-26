@@ -1213,7 +1213,7 @@ func TestUpdateTxRejectsMismatchedConfirmedBlock(t *testing.T) {
 
 	block := CreateBlockFixture(t, queries, walletID, 240)
 	mismatchBlock := block
-	mismatchBlock.Hash = RandomHash()
+	mismatchBlock.Height++
 
 	err = store.UpdateTx(t.Context(), db.UpdateTxParams{
 		WalletID: walletID,
@@ -2099,7 +2099,7 @@ func TestRollbackToBlockRewindsSyncToStoredLowerBlock(t *testing.T) {
 
 	err := store.UpdateWallet(t.Context(), db.UpdateWalletParams{
 		WalletID: walletID,
-		SyncedTo: &forkBlock,
+		SyncedTo: &forkBlock, BirthdayBlock: &forkBlock,
 	})
 	require.NoError(t, err)
 

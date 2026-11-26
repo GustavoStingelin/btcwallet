@@ -15,6 +15,7 @@ INSERT INTO transactions (
     tx_hash,
     raw_tx,
     block_height,
+    tree_block_id,
     confirmed_order,
     tx_status,
     received_time,
@@ -25,6 +26,7 @@ INSERT INTO transactions (
     sqlc.arg('tx_hash'),
     sqlc.arg('raw_tx'),
     sqlc.narg('block_height')::INTEGER,
+    sqlc.narg('block_id'),
     CASE
         WHEN sqlc.narg('block_height')::INTEGER IS NULL THEN NULL
         ELSE nextval('transactions_confirmed_order_seq')
@@ -69,16 +71,13 @@ SELECT
     t.raw_tx,
     t.received_time,
     t.block_height,
-    b.header_hash AS block_hash,
+    b.block_hash,
     b.block_timestamp,
     t.is_coinbase,
     t.tx_status,
     t.tx_label
 FROM transactions AS t
-LEFT JOIN wallet_blocks AS b
-    ON
-        t.block_height = b.block_height
-        AND t.wallet_id = b.wallet_id
+LEFT JOIN tree_blocks AS b ON t.tree_block_id = b.id
 WHERE t.wallet_id = $1 AND t.tx_hash = $2;
 
 -- name: ListTransactionsWithoutBlock :many
@@ -160,16 +159,13 @@ SELECT
     t.raw_tx,
     t.received_time,
     t.block_height,
-    b.header_hash AS block_hash,
+    b.block_hash,
     b.block_timestamp,
     t.is_coinbase,
     t.tx_status,
     t.tx_label
 FROM transactions AS t
-INNER JOIN wallet_blocks AS b
-    ON
-        t.block_height = b.block_height
-        AND t.wallet_id = b.wallet_id
+INNER JOIN tree_blocks AS b ON t.tree_block_id = b.id
 WHERE
     t.wallet_id = sqlc.arg('wallet_id')
     AND t.block_height BETWEEN
@@ -260,12 +256,13 @@ SET
     confirmed_order = CASE
         WHEN sqlc.narg('block_height')::INTEGER IS NULL THEN NULL
         WHEN
-            block_height = sqlc.narg('block_height')::INTEGER
+            tree_block_id = sqlc.narg('block_id')
             AND confirmed_order IS NOT NULL
             THEN confirmed_order
         ELSE nextval('transactions_confirmed_order_seq')
     END,
     block_height = sqlc.narg('block_height')::INTEGER,
+    tree_block_id = sqlc.narg('block_id'),
     tx_status = sqlc.arg('status')
 WHERE
     wallet_id = sqlc.arg('wallet_id')
@@ -348,47 +345,28 @@ WHERE
 ORDER BY wallet_id, id;
 
 -- name: RewindWalletSyncStateHeightsForRollback :execrows
--- Rewrites wallet sync-state heights so they stop referencing blocks that are
--- about to be deleted during RollbackToBlock.
---
--- How:
--- - Computes the greatest stored block below the rollback boundary.
--- - Rewrites both synced_height and birthday_height in one statement so the
---   subsequent block delete does not violate `ON DELETE RESTRICT`.
--- - Example: if `rollback_height = 195`, affected sync heights rewind to the
---   greatest stored block below 195, not necessarily 194 on sparse block tables.
--- - If there is no stored block below the boundary, the sync state no longer
---   points at any surviving block row.
--- Performance:
--- - Touches only wallet_sync_states rows whose heights are at or above the
---   rollback boundary.
+-- Move affected references to the caller-selected retained Wallet block.
 UPDATE wallet_sync_states
 SET
     synced_height = CASE
-        WHEN
-            synced_height IS NOT NULL
-            AND synced_height >= sqlc.arg('rollback_height')::INTEGER
-            THEN (
-                SELECT max(block_height)::INTEGER
-                FROM wallet_blocks
-                WHERE
-                    wallet_id = sqlc.arg('wallet_id')::BIGINT
-                    AND block_height < sqlc.arg('rollback_height')::INTEGER
-            )
+        WHEN synced_height >= sqlc.arg('rollback_height')::INTEGER
+            THEN sqlc.narg('previous_height')::INTEGER
         ELSE synced_height
     END,
+    last_scanned_tree_block_id = CASE
+        WHEN synced_height >= sqlc.arg('rollback_height')::INTEGER
+            THEN sqlc.narg('previous_block_id')::BIGINT
+        ELSE last_scanned_tree_block_id
+    END,
     birthday_height = CASE
-        WHEN
-            birthday_height IS NOT NULL
-            AND birthday_height >= sqlc.arg('rollback_height')::INTEGER
-            THEN (
-                SELECT max(block_height)::INTEGER
-                FROM wallet_blocks
-                WHERE
-                    wallet_id = sqlc.arg('wallet_id')::BIGINT
-                    AND block_height < sqlc.arg('rollback_height')::INTEGER
-            )
+        WHEN birthday_height >= sqlc.arg('rollback_height')::INTEGER
+            THEN sqlc.narg('previous_height')::INTEGER
         ELSE birthday_height
+    END,
+    birthday_block_id = CASE
+        WHEN birthday_height >= sqlc.arg('rollback_height')::INTEGER
+            THEN sqlc.narg('previous_block_id')::BIGINT
+        ELSE birthday_block_id
     END,
     updated_at = current_timestamp AT TIME ZONE 'UTC'
 WHERE
@@ -405,15 +383,13 @@ WHERE
     );
 
 -- name: DeleteBlocksAtOrAboveHeight :execrows
--- Deletes blocks at and after the provided height.
---
--- How:
--- - Deletes only the owning Wallet range in wallet_blocks.
--- - Relies on FK/trigger side effects to null transaction block references and
---   orphan coinbase rows.
--- Performance:
--- - Executes as a range delete over the block-height primary key.
-DELETE FROM wallet_blocks
+-- Explicit height rollback detaches Wallet confirmations, not shared blocks.
+UPDATE transactions
+SET
+    block_height = NULL,
+    tree_block_id = NULL,
+    confirmed_order = NULL,
+    tx_status = CASE WHEN is_coinbase THEN 4 ELSE tx_status END
 WHERE
     wallet_id = sqlc.arg('wallet_id')::BIGINT
     AND block_height >= sqlc.arg('rollback_height')::INTEGER;

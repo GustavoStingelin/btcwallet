@@ -36,9 +36,10 @@ CREATE TABLE transactions (
     -- NULL = Unconfirmed (mempool)
     -- INT  = Confirmed (mined)
     --
-    -- The parent delete trigger clears the confirmation edge before its
-    -- composite FK is removed, retaining the transaction's Wallet identity.
+    -- Keep the height for wallet range indexes; the ID identifies the fork.
     block_height INTEGER,
+
+    tree_block_id BIGINT,
 
     -- Monotonic token assigned when a row becomes confirmed. Confirmed range
     -- reads use it as the block-local tie-breaker so rows first seen as
@@ -73,9 +74,10 @@ CREATE TABLE transactions (
     --
     tx_label VARCHAR(500) NOT NULL DEFAULT '',
 
-    -- Confirmation edges cannot cross Wallet ownership.
-    FOREIGN KEY (wallet_id, block_height)
-    REFERENCES wallet_blocks (wallet_id, block_height) ON DELETE RESTRICT,
+    -- Confirmation identity and height must refer to the same shared block.
+    CHECK ((tree_block_id IS NULL) = (block_height IS NULL)),
+    FOREIGN KEY (tree_block_id, block_height)
+    REFERENCES tree_blocks (id, block_height) ON DELETE RESTRICT,
 
     -- Wallet-scoped uniqueness lets different wallets record the same network
     -- txid independently while keeping every child lookup anchored to one
@@ -123,6 +125,10 @@ CREATE TABLE transactions (
     )
 );
 
+CREATE INDEX idx_transactions_tree_block
+ON transactions (wallet_id, tree_block_id)
+WHERE tree_block_id IS NOT NULL;
+
 ALTER SEQUENCE transactions_confirmed_order_seq OWNED BY
 transactions.confirmed_order;
 
@@ -161,7 +167,7 @@ ON transactions (wallet_id, received_time DESC);
 -- coinbase atomically. Both explicit rewind and parent deletion use this hook.
 CREATE FUNCTION set_coinbase_orphaned_on_disconnect() RETURNS TRIGGER AS $$
 BEGIN
-    -- Detect an explicit rewind or the parent delete trigger below.
+    -- Clearing a confirmation also clears the edge's ordering token.
     IF NEW.block_height IS NULL AND OLD.block_height IS NOT NULL
         THEN
         -- The confirmation-order token belongs to the disconnected block edge.
@@ -183,21 +189,6 @@ CREATE TRIGGER trg_set_coinbase_orphaned_on_disconnect
 BEFORE UPDATE OF block_height ON transactions
 FOR EACH ROW
 EXECUTE FUNCTION set_coinbase_orphaned_on_disconnect();
-
--- A composite SET NULL FK would also erase wallet_id. Clear only the height;
--- the existing child trigger maintains coinbase status and confirmation order.
-CREATE FUNCTION disconnect_transactions_before_block_delete() RETURNS TRIGGER AS $$
-BEGIN
-    UPDATE transactions SET block_height = NULL
-    WHERE wallet_id = OLD.wallet_id AND block_height = OLD.block_height;
-    RETURN OLD;
-END;
-$$ LANGUAGE plpgsql;
-
-CREATE TRIGGER trg_disconnect_transactions_before_block_delete
-BEFORE DELETE ON wallet_blocks
-FOR EACH ROW
-EXECUTE FUNCTION disconnect_transactions_before_block_delete();
 
 -- Retain immutable input facts independently of wallet credit discovery.
 -- Unknown parents have no credit row, so only the spending transaction is a FK.

@@ -2,6 +2,7 @@ package pg
 
 import (
 	"context"
+	"database/sql"
 	"io"
 	"math"
 	"testing"
@@ -216,25 +217,23 @@ func TestListSyncedBlocksBuildsBlock(t *testing.T) {
 }
 
 // TestEnsureBlockExistsRejectsConflictingBlock verifies that insert-or-ignore
-// block writes still reject a same-height block with different metadata.
+// block writes still reject conflicting metadata for the same hash.
 func TestEnsureBlockExistsRejectsConflictingBlock(t *testing.T) {
 	t.Parallel()
 
-	// Arrange: Make insert-if-absent find a stored block at the same height
-	// whose hash differs, requiring validation of the existing row.
+	// Arrange: The same hash is already indexed at a different height.
 	block := &db.Block{
 		Hash:      chainhash.Hash{8, 9, 10},
 		Height:    144,
 		Timestamp: time.Unix(1710003500, 0),
 	}
-	conflictingHash := chainhash.Hash{10, 9, 8}
 	row := &mockRow{}
 	row.On("Scan", mock.Anything).Run(func(args mock.Arguments) {
 		dest, ok := args.Get(0).([]any)
 		require.True(t, ok)
 		require.NoError(t, scanValues([]any{
-			int32(block.Height), conflictingHash[:],
-			block.Timestamp.Unix(),
+			int64(1), block.Hash[:], int64(block.Height) + 1,
+			block.Timestamp.Unix(), sql.NullInt64{},
 		}, dest))
 	}).Return(nil).Once()
 

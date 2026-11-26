@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/btcsuite/btcd/chainhash/v2"
 	"github.com/btcsuite/btcwallet/wallet/internal/db"
 	"github.com/btcsuite/btcwallet/wallet/internal/sql/sqlite/sqlc"
 )
@@ -31,23 +32,22 @@ func buildBlock(height sql.NullInt64, hash []byte,
 // ensureBlockExists ensures that a block exists in the database. If it
 // doesn't exist, it inserts it.
 func ensureBlockExists(ctx context.Context, qtx *sqlc.Queries,
-	walletID uint32, block *db.Block) error {
+	_ uint32, block *db.Block) error {
 
 	height := int64(block.Height)
 
-	blockParams := sqlc.InsertWalletBlockParams{
-		WalletID:       int64(walletID),
+	blockParams := sqlc.InsertTreeBlockParams{
 		BlockHeight:    height,
-		HeaderHash:     block.Hash[:],
+		BlockHash:      block.Hash[:],
 		BlockTimestamp: block.Timestamp.Unix(),
 	}
 
-	err := qtx.InsertWalletBlock(ctx, blockParams)
+	err := qtx.InsertTreeBlock(ctx, blockParams)
 	if err != nil {
 		return fmt.Errorf("insert block: %w", err)
 	}
 
-	_, err = requireBlockMatches(ctx, qtx, walletID, block)
+	_, err = requireBlockMatches(ctx, qtx, block)
 	if err != nil {
 		return err
 	}
@@ -55,29 +55,26 @@ func ensureBlockExists(ctx context.Context, qtx *sqlc.Queries,
 	return nil
 }
 
-// requireBlockMatches loads the owning Wallet's block row and verifies its
-// metadata against the supplied confirmation reference.
+// requireBlockMatches resolves a shared hash to a validated block ID.
 func requireBlockMatches(ctx context.Context, qtx *sqlc.Queries,
-	walletID uint32, block *db.Block) (int64, error) {
+	block *db.Block) (int64, error) {
 
 	height := int64(block.Height)
 
-	storedBlock, err := qtx.GetWalletBlockByHeight(
-		ctx, sqlc.GetWalletBlockByHeightParams{
-			WalletID: int64(walletID), BlockHeight: height,
-		},
-	)
+	storedBlock, err := qtx.TreeBlockByHash(ctx, block.Hash[:])
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return 0, fmt.Errorf("block %d: %w", block.Height,
 				db.ErrBlockNotFound)
 		}
 
-		return 0, fmt.Errorf("get block by height: %w", err)
+		return 0, fmt.Errorf("get shared block by hash: %w", err)
 	}
 
-	if !bytes.Equal(storedBlock.HeaderHash, block.Hash[:]) {
-		return 0, fmt.Errorf("block %d header hash: %w", block.Height,
+	if storedBlock.BlockHeight != height ||
+		!bytes.Equal(storedBlock.BlockHash, block.Hash[:]) {
+
+		return 0, fmt.Errorf("block %d identity: %w", height,
 			db.ErrBlockMismatch)
 	}
 
@@ -86,5 +83,66 @@ func requireBlockMatches(ctx context.Context, qtx *sqlc.Queries,
 			db.ErrBlockMismatch)
 	}
 
-	return height, nil
+	return storedBlock.ID, nil
+}
+
+// linkNextSyncedBlock closes the edge for a verified adjacent scan advance.
+// An initial checkpoint or explicit jump starts an independent anchor.
+func linkNextSyncedBlock(ctx context.Context, q *sqlc.Queries,
+	walletID uint32, block *db.Block, id int64) error {
+
+	parent, err := q.TreeCheckpoint(ctx, int64(walletID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+
+	if err != nil {
+		return fmt.Errorf("load scanned parent: %w", err)
+	}
+
+	if parent.ID == id {
+		return nil
+	}
+
+	if parent.BlockHeight+1 != int64(block.Height) {
+		if block.ParentHash != (chainhash.Hash{}) {
+			return fmt.Errorf("block %d skips checkpoint %d: %w",
+				block.Height, parent.BlockHeight, db.ErrBlockMismatch)
+		}
+
+		return nil
+	}
+
+	if block.ParentHash != (chainhash.Hash{}) &&
+		!bytes.Equal(block.ParentHash[:], parent.BlockHash) {
+
+		return fmt.Errorf("block %d does not extend checkpoint: %w",
+			block.Height, db.ErrBlockMismatch)
+	}
+
+	return linkTreeParent(ctx, q, id, parent.ID)
+}
+
+// linkTreeParent verifies that the conditional write left the expected edge.
+func linkTreeParent(ctx context.Context, q *sqlc.Queries, childID,
+	parentID int64) error {
+
+	err := q.SetTreeBlockParent(ctx, sqlc.SetTreeBlockParentParams{
+		ID: childID, ParentID: sql.NullInt64{Int64: parentID, Valid: true},
+	})
+	if err != nil {
+		return fmt.Errorf("link scanned child: %w", err)
+	}
+
+	child, err := q.TreeBlockByID(ctx, childID)
+	if err != nil {
+		return fmt.Errorf("read scanned child: %w", err)
+	}
+
+	if !child.ParentID.Valid || child.ParentID.Int64 != parentID {
+		return fmt.Errorf("block %d parent: %w", child.BlockHeight,
+			db.ErrBlockMismatch)
+	}
+
+	return nil
 }

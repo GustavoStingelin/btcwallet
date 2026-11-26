@@ -100,14 +100,7 @@ type Querier interface {
 	// Creates a new key scope for a wallet and returns its ID.
 	CreateKeyScope(ctx context.Context, arg CreateKeyScopeParams) (int64, error)
 	CreateWallet(ctx context.Context, arg CreateWalletParams) (int64, error)
-	// Deletes blocks at and after the provided height.
-	//
-	// How:
-	// - Deletes only the owning Wallet range in wallet_blocks.
-	// - Relies on FK/trigger side effects to null transaction block references and
-	//   orphan coinbase rows.
-	// Performance:
-	// - Executes as a range delete over the block-height primary key.
+	// Explicit height rollback detaches Wallet confirmations, not shared blocks.
 	DeleteBlocksAtOrAboveHeight(ctx context.Context, arg DeleteBlocksAtOrAboveHeightParams) (int64, error)
 	// Deletes all expired lease rows for a wallet.
 	//
@@ -167,8 +160,7 @@ type Querier interface {
 	// - Uses the `(tx_id)` index to keep the delete bounded to one transaction's
 	//   outputs, then rechecks wallet ownership through the parent transaction.
 	DeleteUtxosByTxID(ctx context.Context, arg DeleteUtxosByTxIDParams) (int64, error)
-	// Delete only a proven orphan; higher current-chain observations stay owned.
-	DeleteWalletBlockByHeight(ctx context.Context, arg DeleteWalletBlockByHeightParams) (int64, error)
+	DetachTreeConfirmations(ctx context.Context, arg DetachTreeConfirmationsParams) error
 	// Returns a single account by scope id and account name.
 	GetAccountByScopeAndName(ctx context.Context, arg GetAccountByScopeAndNameParams) (GetAccountByScopeAndNameRow, error)
 	// Returns a single derived account by scope id and account number.
@@ -282,8 +274,7 @@ type Querier interface {
 	// - Uses the wallet-scoped transaction hash lookup first, then narrows to the
 	//   unique `(tx_id, output_index)` outpoint.
 	GetUtxoIDByOutpoint(ctx context.Context, arg GetUtxoIDByOutpointParams) (int64, error)
-	// Block identity belongs to one Wallet, including during replacement replay.
-	GetWalletBlockByHeight(ctx context.Context, arg GetWalletBlockByHeightParams) (GetWalletBlockByHeightRow, error)
+	// Recover the Wallet's view from its scanned branch and referenced blocks.
 	GetWalletBlocksInRange(ctx context.Context, arg GetWalletBlocksInRangeParams) ([]GetWalletBlocksInRangeRow, error)
 	GetWalletByID(ctx context.Context, id int64) (GetWalletByIDRow, error)
 	GetWalletByName(ctx context.Context, walletName string) (GetWalletByNameRow, error)
@@ -319,6 +310,7 @@ type Querier interface {
 	// - Single-row insert. The cost is dominated by the wallet/hash uniqueness
 	//   checks and any optional block foreign-key validation.
 	InsertTransaction(ctx context.Context, arg InsertTransactionParams) (int64, error)
+	InsertTreeBlock(ctx context.Context, arg InsertTreeBlockParams) error
 	// Retain immutable prevout facts independently of wallet credit discovery.
 	// Replaying the same input position preserves the existing indexed fact.
 	InsertTxInput(ctx context.Context, arg InsertTxInputParams) error
@@ -356,8 +348,6 @@ type Querier interface {
 	// - Single-row insert. The main cost is the wallet-ownership validation join
 	//   plus FK and uniqueness checks.
 	InsertUtxo(ctx context.Context, arg InsertUtxoParams) (int64, error)
-	// Verify conflicts through requireBlockMatches in the same write transaction.
-	InsertWalletBlock(ctx context.Context, arg InsertWalletBlockParams) error
 	InsertWalletSecrets(ctx context.Context, arg InsertWalletSecretsParams) error
 	InsertWalletSyncState(ctx context.Context, arg InsertWalletSyncStateParams) error
 	// InspectDatabaseIdentityNamespace permits first adoption only when the fixed
@@ -397,6 +387,7 @@ type Querier interface {
 	// address are simply absent from the result. The Go caller is responsible for
 	// short-circuiting an empty script set before issuing this query.
 	ListAddressesByScriptPubKeys(ctx context.Context, arg ListAddressesByScriptPubKeysParams) ([]ListAddressesByScriptPubKeysRow, error)
+	ListAheadConfirmationHeights(ctx context.Context, arg ListAheadConfirmationHeightsParams) ([]int64, error)
 	// Lists unconfirmed transactions that share an input with this transaction.
 	// Parent credits need not be known: the lookup matches retained prevouts.
 	ListConflictingTransactions(ctx context.Context, arg ListConflictingTransactionsParams) ([]ListConflictingTransactionsRow, error)
@@ -568,21 +559,12 @@ type Querier interface {
 	ReleaseUtxoLease(ctx context.Context, arg ReleaseUtxoLeaseParams) (int64, error)
 	// Rewind scanned progress across removed history; move birthday only on removal.
 	RewindWalletReferencesForDisconnect(ctx context.Context, arg RewindWalletReferencesForDisconnectParams) (int64, error)
-	// Rewrites wallet sync-state heights so they stop referencing blocks that are
-	// about to be deleted during RollbackToBlock.
-	//
-	// How:
-	// - Computes the greatest stored block below the rollback boundary.
-	// - Rewrites both synced_height and birthday_height in one statement so the
-	//   subsequent block delete does not violate `ON DELETE RESTRICT`.
-	// - Example: if `rollback_height = 195`, affected sync heights rewind to the
-	//   greatest stored block below 195, not necessarily 194 on sparse block tables.
-	// - If there is no stored block below the boundary, the sync state no longer
-	//   points at any surviving block row.
-	// Performance:
-	// - Touches only wallet_sync_states rows whose heights are at or above the
-	//   rollback boundary.
+	// Move affected references to the caller-selected retained Wallet block.
 	RewindWalletSyncStateHeightsForRollback(ctx context.Context, arg RewindWalletSyncStateHeightsForRollbackParams) (int64, error)
+	SetTreeBlockParent(ctx context.Context, arg SetTreeBlockParentParams) error
+	TreeBlockByHash(ctx context.Context, blockHash []byte) (TreeBlock, error)
+	TreeBlockByID(ctx context.Context, id int64) (TreeBlock, error)
+	TreeCheckpoint(ctx context.Context, walletID int64) (TreeBlock, error)
 	// Renames an account identified by wallet id, scope tuple, and current name.
 	UpdateAccountNameByWalletScopeAndName(ctx context.Context, arg UpdateAccountNameByWalletScopeAndNameParams) (int64, error)
 	// Renames a derived account identified by wallet id, scope tuple, and number.

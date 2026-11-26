@@ -9,63 +9,77 @@ import (
 	"context"
 )
 
-const DeleteWalletBlockByHeight = `-- name: DeleteWalletBlockByHeight :execrows
-DELETE FROM wallet_blocks
-WHERE wallet_id = cast(?1 AS INTEGER) AND block_height = cast(?2 AS INTEGER)
-`
-
-type DeleteWalletBlockByHeightParams struct {
-	WalletID    int64
-	BlockHeight int64
-}
-
-// Delete only a proven orphan; higher current-chain observations stay owned.
-func (q *Queries) DeleteWalletBlockByHeight(ctx context.Context, arg DeleteWalletBlockByHeightParams) (int64, error) {
-	result, err := q.exec(ctx, q.deleteWalletBlockByHeightStmt, DeleteWalletBlockByHeight, arg.WalletID, arg.BlockHeight)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected()
-}
-
-const GetWalletBlockByHeight = `-- name: GetWalletBlockByHeight :one
-SELECT
-    block_height,
-    header_hash,
-    block_timestamp
-FROM wallet_blocks
-WHERE wallet_id = cast(?1 AS INTEGER) AND block_height = cast(?2 AS INTEGER)
-`
-
-type GetWalletBlockByHeightParams struct {
-	WalletID    int64
-	BlockHeight int64
-}
-
-type GetWalletBlockByHeightRow struct {
-	BlockHeight    int64
-	HeaderHash     []byte
-	BlockTimestamp int64
-}
-
-// Block identity belongs to one Wallet, including during replacement replay.
-func (q *Queries) GetWalletBlockByHeight(ctx context.Context, arg GetWalletBlockByHeightParams) (GetWalletBlockByHeightRow, error) {
-	row := q.queryRow(ctx, q.getWalletBlockByHeightStmt, GetWalletBlockByHeight, arg.WalletID, arg.BlockHeight)
-	var i GetWalletBlockByHeightRow
-	err := row.Scan(&i.BlockHeight, &i.HeaderHash, &i.BlockTimestamp)
-	return i, err
-}
-
 const GetWalletBlocksInRange = `-- name: GetWalletBlocksInRange :many
+WITH RECURSIVE scanned (id, block_height, header_hash, block_timestamp, parent_id) AS (
+    SELECT
+        b.id,
+        b.block_height,
+        b.block_hash AS header_hash,
+        b.block_timestamp,
+        b.parent_id
+    FROM wallet_sync_states AS s
+    INNER JOIN tree_blocks AS b ON s.last_scanned_tree_block_id = b.id
+    WHERE s.wallet_id = cast(?1 AS INTEGER)
+    UNION ALL
+    SELECT
+        b.id,
+        b.block_height,
+        b.block_hash,
+        b.block_timestamp,
+        b.parent_id
+    FROM scanned AS child
+    INNER JOIN tree_blocks AS b ON child.parent_id = b.id
+    WHERE child.block_height > cast(?2 AS INTEGER)
+),
+
+candidates AS (
+    SELECT
+        id,
+        block_height,
+        header_hash,
+        block_timestamp,
+        0 AS priority
+    FROM scanned
+    UNION ALL
+    SELECT
+        b.id,
+        b.block_height,
+        b.block_hash,
+        b.block_timestamp,
+        1 AS priority
+    FROM wallet_sync_states AS s
+    INNER JOIN tree_blocks AS b ON s.birthday_block_id = b.id
+    WHERE s.wallet_id = cast(?1 AS INTEGER)
+    UNION ALL
+    SELECT DISTINCT
+        b.id,
+        b.block_height,
+        b.block_hash,
+        b.block_timestamp,
+        2 AS priority
+    FROM transactions AS t
+    INNER JOIN tree_blocks AS b ON t.tree_block_id = b.id
+    WHERE
+        t.wallet_id = cast(?1 AS INTEGER)
+        AND t.block_height BETWEEN cast(?2 AS INTEGER) AND cast(?3 AS INTEGER)
+),
+
+selected AS (
+    SELECT
+        block_height,
+        header_hash,
+        block_timestamp,
+        row_number() OVER (PARTITION BY block_height ORDER BY priority ASC, id DESC) AS block_rank
+    FROM candidates
+    WHERE block_height BETWEEN cast(?2 AS INTEGER) AND cast(?3 AS INTEGER)
+)
+
 SELECT
-    block_height,
-    header_hash,
-    block_timestamp
-FROM wallet_blocks
-WHERE
-    wallet_id = cast(?1 AS INTEGER)
-    AND block_height >= cast(?2 AS INTEGER)
-    AND block_height <= cast(?3 AS INTEGER)
+    cast(block_height AS INTEGER) AS block_height,
+    cast(header_hash AS BLOB) AS header_hash,
+    cast(block_timestamp AS INTEGER) AS block_timestamp
+FROM selected
+WHERE block_rank = 1
 ORDER BY block_height
 `
 
@@ -81,6 +95,7 @@ type GetWalletBlocksInRangeRow struct {
 	BlockTimestamp int64
 }
 
+// Recover the Wallet's view from its scanned branch and referenced blocks.
 func (q *Queries) GetWalletBlocksInRange(ctx context.Context, arg GetWalletBlocksInRangeParams) ([]GetWalletBlocksInRangeRow, error) {
 	rows, err := q.query(ctx, q.getWalletBlocksInRangeStmt, GetWalletBlocksInRange, arg.WalletID, arg.StartHeight, arg.EndHeight)
 	if err != nil {
@@ -102,35 +117,4 @@ func (q *Queries) GetWalletBlocksInRange(ctx context.Context, arg GetWalletBlock
 		return nil, err
 	}
 	return items, nil
-}
-
-const InsertWalletBlock = `-- name: InsertWalletBlock :exec
-INSERT INTO wallet_blocks (
-    wallet_id, block_height, header_hash, block_timestamp
-)
-VALUES (
-    cast(?1 AS INTEGER),
-    cast(?2 AS INTEGER),
-    ?3,
-    ?4
-)
-ON CONFLICT DO NOTHING
-`
-
-type InsertWalletBlockParams struct {
-	WalletID       int64
-	BlockHeight    int64
-	HeaderHash     []byte
-	BlockTimestamp int64
-}
-
-// Verify conflicts through requireBlockMatches in the same write transaction.
-func (q *Queries) InsertWalletBlock(ctx context.Context, arg InsertWalletBlockParams) error {
-	_, err := q.exec(ctx, q.insertWalletBlockStmt, InsertWalletBlock,
-		arg.WalletID,
-		arg.BlockHeight,
-		arg.HeaderHash,
-		arg.BlockTimestamp,
-	)
-	return err
 }

@@ -13,6 +13,62 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// TestScanLinksSparseConfirmation checks that a scan closes a missing parent
+// edge without copying the block or moving another wallet's checkpoint.
+func TestScanLinksSparseConfirmation(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	store := NewTestStore(t)
+	id := newWallet(t, store, "scan sparse")
+	sibling := newWallet(t, store, "observe sparse")
+	anchor, middle, mined := NewBlockFixture(98), NewBlockFixture(99),
+		NewBlockFixture(100)
+	middle.ParentHash, mined.ParentHash = anchor.Hash, middle.Hash
+
+	tx := newRegularTx(
+		[]wire.OutPoint{randomOutPoint()},
+		[]*wire.TxOut{{Value: 1000, PkScript: []byte{0x51}}},
+	)
+	for _, walletID := range []uint32{id, sibling} {
+		require.NoError(t, store.ApplyScanBatch(ctx, db.ScanBatchParams{
+			WalletID: walletID, SyncedBlocks: []db.Block{anchor},
+		}))
+		require.NoError(t, store.ApplyTxBatch(ctx, db.TxBatchParams{
+			WalletID: walletID,
+			Transactions: []db.CreateTxParams{{
+				WalletID: walletID, Tx: tx, Block: &mined,
+				Status: db.TxStatusPublished, Received: mined.Timestamp,
+			}},
+		}))
+	}
+
+	before, err := store.Queries().TreeBlockByHash(ctx, mined.Hash[:])
+	require.NoError(t, err)
+	require.False(t, before.ParentID.Valid)
+
+	require.ErrorIs(t, store.ApplyScanBatch(ctx, db.ScanBatchParams{
+		WalletID: id, SyncedBlocks: []db.Block{mined},
+	}), db.ErrBlockMismatch)
+	require.NoError(t, store.ApplyScanBatch(ctx, db.ScanBatchParams{
+		WalletID: id, SyncedBlocks: []db.Block{middle, mined},
+	}))
+
+	// The exact ID is retained; an orphan may still be shared by other
+	// wallets even when their scan progress follows a different path.
+	after, err := store.Queries().TreeBlockByHash(ctx, mined.Hash[:])
+	require.NoError(t, err)
+	parent, err := store.Queries().TreeBlockByHash(ctx, middle.Hash[:])
+	require.NoError(t, err)
+	require.Equal(t, before.ID, after.ID)
+	require.True(t, after.ParentID.Valid)
+	require.Equal(t, parent.ID, after.ParentID.Int64)
+
+	siblingInfo, err := store.GetWallet(ctx, "observe sparse")
+	require.NoError(t, err)
+	require.Equal(t, anchor.Hash, siblingInfo.SyncedTo.Hash)
+}
+
 // TestDisconnectBlockReconcilesMissingObservation verifies that an empty
 // disconnect can invalidate an older payment learned ahead of scan progress.
 func TestDisconnectBlockReconcilesMissingObservation(t *testing.T) {
@@ -122,8 +178,8 @@ func TestRollbackPreservesStateOnFailure(t *testing.T) {
 			Credits:  map[uint32]address.Address{0: nil},
 		})
 		require.NoError(t, err)
-		err = store.UpdateWallet(ctx, db.UpdateWalletParams{
-			WalletID: id, SyncedTo: &tip,
+		err = store.ApplyScanBatch(ctx, db.ScanBatchParams{
+			WalletID: id, SyncedBlocks: []db.Block{fork, tip},
 		})
 		require.NoError(t, err)
 
@@ -236,9 +292,12 @@ func TestRollbackToBlockRewindsSyncTipAndRollsBack(t *testing.T) {
 	})
 	require.NoError(t, err)
 
+	err = store.ApplyScanBatch(t.Context(), db.ScanBatchParams{
+		WalletID: walletID, SyncedBlocks: []db.Block{forkBlock, confirmedBlock},
+	})
+	require.NoError(t, err)
 	err = store.UpdateWallet(t.Context(), db.UpdateWalletParams{
 		WalletID:      walletID,
-		SyncedTo:      &confirmedBlock,
 		BirthdayBlock: &confirmedBlock,
 	})
 	require.NoError(t, err)
@@ -333,11 +392,11 @@ func TestDisconnectBlockIdentities(t *testing.T) {
 			wantRewind: true,
 		},
 		{
-			name:       "stale after replacement with unrelated fork",
+			name:       "stale after canonical replacement",
 			forkDelta:  1,
 			forkHeight: 1,
 			storedHash: chainhash.Hash{3},
-			proof:      map[uint32]*chainhash.Hash{2: {4}},
+			proof:      map[uint32]*chainhash.Hash{2: {3}},
 		},
 		{
 			name:       "wrong fork hash",
@@ -377,9 +436,13 @@ func TestDisconnectBlockIdentities(t *testing.T) {
 			}
 			stored := disconnected
 			stored.Hash = tc.storedHash
+			require.NoError(t, store.ApplyScanBatch(
+				t.Context(), db.ScanBatchParams{
+					WalletID: walletID, SyncedBlocks: []db.Block{fork, stored},
+				},
+			))
 			err := store.UpdateWallet(t.Context(), db.UpdateWalletParams{
 				WalletID:      walletID,
-				SyncedTo:      &stored,
 				BirthdayBlock: &stored,
 			})
 			require.NoError(t, err)
@@ -450,8 +513,8 @@ func TestDisconnectBlockPreservesCanonicalHistory(t *testing.T) {
 	t.Parallel()
 
 	// Arrange: Catch-up is committed only through 419, but a live canonical
-	// empty row at 420 and coinbase at 421 are already recorded. The orphan
-	// at 422 cannot invalidate that history or demand proof for the empty tail.
+	// coinbase at 421 is already recorded. Unreferenced blocks are not
+	// part of the Wallet's view and require no disconnect proof.
 	store := NewTestStore(t)
 	walletID := newWallet(t, store, "canonical-live-history")
 	createDerivedAccount(t, store, walletID, db.KeyScopeBIP0084, "default")
@@ -530,8 +593,8 @@ func TestDisconnectBlockPreservesCanonicalHistory(t *testing.T) {
 			EndHeight:   empty.Height,
 		},
 	)
-	require.NoError(t, err)
-	require.Equal(t, empty.Hash, retained[0].Hash)
+	require.ErrorIs(t, err, db.ErrBlockNotFound)
+	require.Empty(t, retained)
 	_, err = store.ListSyncedBlocks(t.Context(), db.ListSyncedBlocksQuery{
 		WalletID:    walletID,
 		StartHeight: orphan.Height,
@@ -555,11 +618,13 @@ func TestDisconnectBlockPreservesHigherCanonicalHistory(t *testing.T) {
 	)
 	fork, observed := NewBlockFixture(419), NewBlockFixture(420)
 	canonical, orphan := NewBlockFixture(421), NewBlockFixture(422)
+	oldTip := canonical
+	oldTip.Hash[0] ^= 1
 	replacement := observed
 	replacement.Hash[0] ^= 0xff
 
 	require.NoError(t, store.ApplyScanBatch(t.Context(), db.ScanBatchParams{
-		WalletID: walletID, SyncedBlocks: []db.Block{fork, observed},
+		WalletID: walletID, SyncedBlocks: []db.Block{fork, observed, oldTip},
 	}))
 
 	coinbase := newCoinbaseTx(addr.ScriptPubKey)
@@ -575,7 +640,7 @@ func TestDisconnectBlockPreservesHigherCanonicalHistory(t *testing.T) {
 	)
 	received := time.Unix(1710004200, 0)
 	err := store.ApplyTxBatch(t.Context(), db.TxBatchParams{
-		WalletID: walletID, SyncedTo: &canonical,
+		WalletID: walletID,
 		Transactions: []db.CreateTxParams{
 			{
 				WalletID: walletID,
@@ -614,7 +679,7 @@ func TestDisconnectBlockPreservesHigherCanonicalHistory(t *testing.T) {
 	require.NoError(t, err)
 	before, err := store.GetWallet(t.Context(), "higher-canonical-history")
 	require.NoError(t, err)
-	require.Equal(t, canonical.Height, before.SyncedTo.Height)
+	require.Equal(t, oldTip.Hash, before.SyncedTo.Hash)
 	parentBefore, err := store.GetTx(t.Context(), db.GetTxQuery{
 		WalletID: walletID, Txid: coinbase.TxHash(),
 	})

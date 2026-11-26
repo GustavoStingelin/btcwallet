@@ -503,7 +503,7 @@ func TestRollbackToBlockReturnsQueryErrorWhenBlocksTableMissing(t *testing.T) {
 	// so the failure concerns missing storage rather than an unknown identity.
 	store := NewTestStore(t)
 	walletID := newWallet(t, store, "missing-block-history")
-	dropTableForCorruption(t, store, "wallet_blocks")
+	dropTableForCorruption(t, store, "tree_blocks")
 
 	// Act: Ask rollback to disconnect blocks from height one.
 	err := store.RollbackToBlock(t.Context(), walletID, 1)

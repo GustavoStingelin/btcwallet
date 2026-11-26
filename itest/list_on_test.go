@@ -374,6 +374,14 @@ var allTestCases = []*testCase{
 		TestFunc: testWalletSyncRollback,
 	},
 	{
+		Name:     "wallet sync offline rollback",
+		TestFunc: testWalletSyncOfflineRollback,
+	},
+	{
+		Name:     "wallet sync sparse rollback",
+		TestFunc: testWalletSyncSparseRollback,
+	},
+	{
 		Name:     "signer derive pubkey paths",
 		TestFunc: testSignerDerivePubKeyPaths,
 	},
