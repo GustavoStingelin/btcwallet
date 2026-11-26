@@ -105,7 +105,7 @@ func TestPgTxStoreOpsWrapBackendErrors(t *testing.T) {
 	_, err = rollbackOps.ListRollbackRootHashes(t.Context(), 1)
 	require.ErrorContains(t, err, "query rollback coinbase roots")
 
-	err = rollbackOps.RewindWalletSyncStateHeights(t.Context(), 1)
+	err = rollbackOps.RewindWalletSyncStateHeights(t.Context(), 0)
 	require.ErrorContains(t, err, "rewind wallet sync state heights query")
 
 	err = rollbackOps.DeleteBlocksAtOrAboveHeight(t.Context(), 1)

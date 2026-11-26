@@ -33,12 +33,7 @@ const (
 	driverConstraintImmutable = sqlite3.SQLITE_CONSTRAINT_TRIGGER
 )
 
-// insertWalletBlockParams lets the shared test use SQLite's native height type.
-type insertWalletBlockParams = sqlc.InsertWalletBlockParams
-
-// getWalletBlocksInRangeParams keeps SQLite's int64 bounds so the shared
-// regression can check the stored block through the native query.
-type getWalletBlocksInRangeParams = sqlc.GetWalletBlocksInRangeParams
+type insertTreeBlockParams = sqlc.InsertTreeBlockParams
 
 // testBackend returns the SQL backend expected by SQLite itests.
 func testBackend() dberr.Backend {
@@ -78,18 +73,17 @@ func requireDriverConstraintError(t *testing.T, err error,
 	require.Equal(t, expected[0], sqliteErr.Code())
 }
 
-// CreateBlockFixture inserts history owned by the given Wallet and returns it.
+// CreateBlockFixture inserts shared metadata for a later confirmation.
 func CreateBlockFixture(t *testing.T, queries *sqlc.Queries,
-	walletID, height uint32) db.Block {
+	_, height uint32) db.Block {
 
 	t.Helper()
 
 	block := NewBlockFixture(height)
-	err := queries.InsertWalletBlock(
-		t.Context(), sqlc.InsertWalletBlockParams{
-			WalletID:       int64(walletID),
+	err := queries.InsertTreeBlock(
+		t.Context(), sqlc.InsertTreeBlockParams{
 			BlockHeight:    int64(block.Height),
-			HeaderHash:     block.Hash[:],
+			BlockHash:      block.Hash[:],
 			BlockTimestamp: block.Timestamp.Unix(),
 		},
 	)

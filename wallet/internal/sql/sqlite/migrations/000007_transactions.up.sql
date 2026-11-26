@@ -23,9 +23,10 @@ CREATE TABLE transactions (
     -- NULL = Unconfirmed (mempool)
     -- INT  = Confirmed (mined)
     --
-    -- The parent delete trigger clears the confirmation edge before its
-    -- composite FK is removed, retaining the transaction's Wallet identity.
+    -- Keep the height for wallet range indexes; the ID identifies the fork.
     block_height INTEGER,
+
+    tree_block_id INTEGER,
 
     -- Monotonic token assigned when a row becomes confirmed. Confirmed range
     -- reads use it as the block-local tie-breaker so rows first seen as
@@ -62,9 +63,9 @@ CREATE TABLE transactions (
     tx_label TEXT NOT NULL DEFAULT ''
     CHECK (length(tx_label) <= 500),
 
-    -- Confirmation edges cannot cross Wallet ownership.
-    FOREIGN KEY (wallet_id, block_height)
-    REFERENCES wallet_blocks (wallet_id, block_height) ON DELETE RESTRICT,
+    CHECK ((tree_block_id IS NULL) = (block_height IS NULL)),
+    FOREIGN KEY (tree_block_id, block_height)
+    REFERENCES tree_blocks (id, block_height) ON DELETE RESTRICT,
 
     -- Secondary unique constraint used as the referenced key for wallet-scoped
     -- child relations such as utxos and tx_replacements.
@@ -116,6 +117,10 @@ CREATE TABLE transactions (
     )
 );
 
+CREATE INDEX idx_transactions_tree_block
+ON transactions (wallet_id, tree_block_id)
+WHERE tree_block_id IS NOT NULL;
+
 -- Optimization for unmined pending/published transaction lookups.
 CREATE INDEX idx_transactions_unconfirmed
 ON transactions (wallet_id, block_height)
@@ -146,30 +151,6 @@ WHERE block_height IS NOT NULL;
 -- Optimization for "latest transactions" queries.
 CREATE INDEX idx_transactions_by_received_time
 ON transactions (wallet_id, received_time DESC);
-
--- Disconnect only the owning Wallet's confirmation edges before its block
--- disappears. Rewriting status and order in the same statement preserves
--- coinbase CHECK constraints and never clears the composite FK's wallet_id.
-CREATE TRIGGER trg_disconnect_transactions_before_block_delete
-BEFORE DELETE ON wallet_blocks
-FOR EACH ROW
-BEGIN
-    -- Rewrite every child transaction that points at the deleted block height.
-    UPDATE transactions
-    SET
-        -- Coinbase rows must become orphaned in the same UPDATE that clears
-        -- block_height so the CHECK constraints never observe an impossible
-        -- "coinbase + NULL block + published" combination.
-        tx_status = CASE
-            WHEN is_coinbase THEN 4
-            -- Ordinary transactions just become unmined; their non-orphaned
-            -- status is preserved for later rollback/invalidation handling.
-            ELSE tx_status
-        END,
-        block_height = NULL,
-        confirmed_order = NULL
-    WHERE wallet_id = old.wallet_id AND block_height = old.block_height;
-END;
 
 -- Retain immutable input facts independently of wallet credit discovery.
 -- Unknown parents have no credit row, so only the spending transaction is a FK.

@@ -40,10 +40,9 @@ func TestCreateTxOpsAdditionalBranches(t *testing.T) {
 			qtx: sqlc.New(rowDBTX{
 				row: newRow(
 					t,
-					"SELECT ?, ?, ?",
-					int64(block.Height),
-					block.Hash[:],
-					block.Timestamp.Unix(),
+					"SELECT ?, ?, ?, ?, NULL",
+					int64(1), block.Hash[:],
+					int64(block.Height), block.Timestamp.Unix(),
 				),
 				rows: 0,
 			}),
@@ -70,7 +69,7 @@ func TestCreateTxOpsAdditionalBranches(t *testing.T) {
 		Params: db.CreateTxParams{WalletID: 1, Block: block},
 	})
 	// Assert: The preparation failure identifies the block lookup.
-	require.ErrorContains(t, err, "get block by height")
+	require.ErrorContains(t, err, "get shared block by hash")
 
 	// Arrange: Fail the input lookup before competing rows can be updated.
 	conflictOps := &createTxOps{

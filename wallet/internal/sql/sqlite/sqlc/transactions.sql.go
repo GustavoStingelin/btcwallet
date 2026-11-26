@@ -13,7 +13,12 @@ import (
 )
 
 const DeleteBlocksAtOrAboveHeight = `-- name: DeleteBlocksAtOrAboveHeight :execrows
-DELETE FROM wallet_blocks
+UPDATE transactions
+SET
+    block_height = NULL,
+    tree_block_id = NULL,
+    confirmed_order = NULL,
+    tx_status = CASE WHEN is_coinbase THEN 4 ELSE tx_status END
 WHERE
     wallet_id = cast(?1 AS INTEGER)
     AND block_height >= cast(?2 AS INTEGER)
@@ -24,15 +29,7 @@ type DeleteBlocksAtOrAboveHeightParams struct {
 	RollbackHeight int64
 }
 
-// Deletes blocks at and after the provided height.
-//
-// How:
-//   - Deletes only the owning Wallet range in wallet_blocks.
-//   - Relies on FK/trigger side effects to null transaction block references and
-//     orphan coinbase rows.
-//
-// Performance:
-// - Executes as a range delete over the block-height primary key.
+// Explicit height rollback detaches Wallet confirmations, not shared blocks.
 func (q *Queries) DeleteBlocksAtOrAboveHeight(ctx context.Context, arg DeleteBlocksAtOrAboveHeightParams) (int64, error) {
 	result, err := q.exec(ctx, q.deleteBlocksAtOrAboveHeightStmt, DeleteBlocksAtOrAboveHeight, arg.WalletID, arg.RollbackHeight)
 	if err != nil {
@@ -115,16 +112,13 @@ SELECT
     t.raw_tx,
     t.received_time,
     t.block_height,
-    b.header_hash AS block_hash,
+    b.block_hash,
     b.block_timestamp,
     t.is_coinbase,
     t.tx_status,
     t.tx_label
 FROM transactions AS t
-LEFT JOIN wallet_blocks AS b
-    ON
-        t.block_height = b.block_height
-        AND t.wallet_id = b.wallet_id
+LEFT JOIN tree_blocks AS b ON t.tree_block_id = b.id
 WHERE t.wallet_id = ? AND t.tx_hash = ?
 `
 
@@ -225,6 +219,7 @@ INSERT INTO transactions (
     tx_hash,
     raw_tx,
     block_height,
+    tree_block_id,
     confirmed_order,
     tx_status,
     received_time,
@@ -235,6 +230,7 @@ INSERT INTO transactions (
     ?2,
     ?3,
     cast(?4 AS INTEGER),
+    ?5,
     CASE
         WHEN cast(?4 AS INTEGER) IS NULL THEN NULL
         ELSE (
@@ -242,10 +238,10 @@ INSERT INTO transactions (
             FROM transactions
         )
     END,
-    ?5,
     ?6,
     ?7,
-    ?8
+    ?8,
+    ?9
 )
 RETURNING id
 `
@@ -255,6 +251,7 @@ type InsertTransactionParams struct {
 	TxHash       []byte
 	RawTx        []byte
 	BlockHeight  sql.NullInt64
+	BlockID      sql.NullInt64
 	TxStatus     int64
 	ReceivedTime time.Time
 	IsCoinbase   bool
@@ -279,6 +276,7 @@ func (q *Queries) InsertTransaction(ctx context.Context, arg InsertTransactionPa
 		arg.TxHash,
 		arg.RawTx,
 		arg.BlockHeight,
+		arg.BlockID,
 		arg.TxStatus,
 		arg.ReceivedTime,
 		arg.IsCoinbase,
@@ -498,16 +496,13 @@ SELECT
     t.raw_tx,
     t.received_time,
     t.block_height,
-    b.header_hash AS block_hash,
+    b.block_hash,
     b.block_timestamp,
     t.is_coinbase,
     t.tx_status,
     t.tx_label
 FROM transactions AS t
-INNER JOIN wallet_blocks AS b
-    ON
-        t.block_height = b.block_height
-        AND t.wallet_id = b.wallet_id
+INNER JOIN tree_blocks AS b ON t.tree_block_id = b.id
 WHERE
     t.wallet_id = ?1
     AND t.block_height >= cast(?2 AS INTEGER)
@@ -586,13 +581,13 @@ SELECT
     t.raw_tx,
     t.received_time,
     t.block_height,
-    b.header_hash AS block_hash,
+    b.block_hash,
     b.block_timestamp,
     t.is_coinbase,
     t.tx_status,
     t.tx_label
 FROM transactions AS t
-LEFT JOIN wallet_blocks AS b ON 1 = 0
+LEFT JOIN tree_blocks AS b ON 1 = 0
 WHERE
     t.wallet_id = ?
     AND t.block_height IS NULL
@@ -619,7 +614,7 @@ type ListTransactionsWithoutBlockRow struct {
 //   - Includes the active unmined set (`pending` and `published`) together with
 //     retained invalid history such as `failed`, `replaced`, or `orphaned`
 //     rows.
-//   - Projects typed NULL block metadata through `LEFT JOIN wallet_blocks AS b ON 1 = 0`
+//   - Projects typed NULL block metadata through `LEFT JOIN tree_blocks AS b ON 1 = 0`
 //     so sqlc preserves the nullable block columns while the row shape stays
 //     aligned with the confirmed query below.
 //
@@ -666,13 +661,13 @@ SELECT
     t.raw_tx,
     t.received_time,
     t.block_height,
-    b.header_hash AS block_hash,
+    b.block_hash,
     b.block_timestamp,
     t.is_coinbase,
     t.tx_status,
     t.tx_label
 FROM transactions AS t
-LEFT JOIN wallet_blocks AS b ON 1 = 0
+LEFT JOIN tree_blocks AS b ON 1 = 0
 WHERE
     t.wallet_id = ?
     AND t.block_height IS NULL
@@ -700,7 +695,7 @@ type ListUnminedTransactionsRow struct {
 //     in unmined `pending` or `published` status.
 //   - Excludes orphaned/replaced/failed history so delete and rollback logic do
 //     not treat retained invalid rows as active mempool spends.
-//   - Projects typed NULL block metadata through `LEFT JOIN wallet_blocks AS b ON 1 = 0`
+//   - Projects typed NULL block metadata through `LEFT JOIN tree_blocks AS b ON 1 = 0`
 //     so sqlc preserves the nullable block columns while the row shape stays
 //     aligned with other transaction queries.
 //
@@ -745,34 +740,28 @@ const RewindWalletSyncStateHeightsForRollback = `-- name: RewindWalletSyncStateH
 UPDATE wallet_sync_states
 SET
     synced_height = CASE
-        WHEN
-            synced_height IS NOT NULL
-            AND synced_height >= cast(?1 AS INTEGER)
-            THEN (
-                SELECT max(block_height)
-                FROM wallet_blocks
-                WHERE
-                    wallet_id = cast(?2 AS INTEGER)
-                    AND block_height < cast(?1 AS INTEGER)
-            )
+        WHEN synced_height >= cast(?1 AS INTEGER)
+            THEN cast(?2 AS INTEGER)
         ELSE synced_height
     END,
+    last_scanned_tree_block_id = CASE
+        WHEN synced_height >= cast(?1 AS INTEGER)
+            THEN cast(?3 AS INTEGER)
+        ELSE last_scanned_tree_block_id
+    END,
     birthday_height = CASE
-        WHEN
-            birthday_height IS NOT NULL
-            AND birthday_height >= cast(?1 AS INTEGER)
-            THEN (
-                SELECT max(block_height)
-                FROM wallet_blocks
-                WHERE
-                    wallet_id = cast(?2 AS INTEGER)
-                    AND block_height < cast(?1 AS INTEGER)
-            )
+        WHEN birthday_height >= cast(?1 AS INTEGER)
+            THEN cast(?2 AS INTEGER)
         ELSE birthday_height
+    END,
+    birthday_block_id = CASE
+        WHEN birthday_height >= cast(?1 AS INTEGER)
+            THEN cast(?3 AS INTEGER)
+        ELSE birthday_block_id
     END,
     updated_at = current_timestamp
 WHERE
-    wallet_id = cast(?2 AS INTEGER)
+    wallet_id = cast(?4 AS INTEGER)
     AND (
         (
             synced_height IS NOT NULL
@@ -786,27 +775,20 @@ WHERE
 `
 
 type RewindWalletSyncStateHeightsForRollbackParams struct {
-	RollbackHeight int64
-	WalletID       int64
+	RollbackHeight  int64
+	PreviousHeight  sql.NullInt64
+	PreviousBlockID sql.NullInt64
+	WalletID        int64
 }
 
-// Rewrites wallet sync-state heights so they stop referencing blocks that are
-// about to be deleted during RollbackToBlock.
-//
-// How:
-//   - Computes the greatest stored block below the rollback boundary.
-//   - Rewrites both synced_height and birthday_height in one statement so the
-//     subsequent block delete does not violate `ON DELETE RESTRICT`.
-//   - Example: if `rollback_height = 195`, affected sync heights rewind to the
-//     greatest stored block below 195, not necessarily 194 on sparse block tables.
-//   - If there is no stored block below the boundary, the sync state no longer
-//     points at any surviving block row.
-//
-// Performance:
-//   - Touches only wallet_sync_states rows whose heights are at or above the
-//     rollback boundary.
+// Move affected references to the caller-selected retained Wallet block.
 func (q *Queries) RewindWalletSyncStateHeightsForRollback(ctx context.Context, arg RewindWalletSyncStateHeightsForRollbackParams) (int64, error) {
-	result, err := q.exec(ctx, q.rewindWalletSyncStateHeightsForRollbackStmt, RewindWalletSyncStateHeightsForRollback, arg.RollbackHeight, arg.WalletID)
+	result, err := q.exec(ctx, q.rewindWalletSyncStateHeightsForRollbackStmt, RewindWalletSyncStateHeightsForRollback,
+		arg.RollbackHeight,
+		arg.PreviousHeight,
+		arg.PreviousBlockID,
+		arg.WalletID,
+	)
 	if err != nil {
 		return 0, err
 	}
@@ -850,7 +832,7 @@ SET
     confirmed_order = CASE
         WHEN cast(?1 AS INTEGER) IS NULL THEN NULL
         WHEN
-            transactions.block_height = cast(?1 AS INTEGER)
+            transactions.tree_block_id = ?2
             AND transactions.confirmed_order IS NOT NULL
             THEN transactions.confirmed_order
         ELSE (
@@ -859,14 +841,16 @@ SET
         )
     END,
     block_height = cast(?1 AS INTEGER),
-    tx_status = ?2
+    tree_block_id = ?2,
+    tx_status = ?3
 WHERE
-    transactions.wallet_id = ?3
-    AND transactions.tx_hash = ?4
+    transactions.wallet_id = ?4
+    AND transactions.tx_hash = ?5
 `
 
 type UpdateTransactionStateByHashParams struct {
 	BlockHeight sql.NullInt64
+	BlockID     sql.NullInt64
 	Status      int64
 	WalletID    int64
 	TxHash      []byte
@@ -888,6 +872,7 @@ type UpdateTransactionStateByHashParams struct {
 func (q *Queries) UpdateTransactionStateByHash(ctx context.Context, arg UpdateTransactionStateByHashParams) (int64, error) {
 	result, err := q.exec(ctx, q.updateTransactionStateByHashStmt, UpdateTransactionStateByHash,
 		arg.BlockHeight,
+		arg.BlockID,
 		arg.Status,
 		arg.WalletID,
 		arg.TxHash,

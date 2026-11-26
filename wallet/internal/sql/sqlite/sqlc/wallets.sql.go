@@ -56,20 +56,14 @@ SELECT
     s.birthday_height,
     s.birthday_timestamp,
     s.updated_at,
-    b_synced.header_hash AS synced_block_hash,
+    b_synced.block_hash AS synced_block_hash,
     b_synced.block_timestamp AS synced_block_timestamp,
-    b_birthday.header_hash AS birthday_block_hash,
+    b_birthday.block_hash AS birthday_block_hash,
     b_birthday.block_timestamp AS birthday_block_timestamp
 FROM wallets AS w
 LEFT JOIN wallet_sync_states AS s ON w.id = s.wallet_id
-LEFT JOIN wallet_blocks AS b_synced
-    ON
-        s.synced_height = b_synced.block_height
-        AND s.wallet_id = b_synced.wallet_id
-LEFT JOIN wallet_blocks AS b_birthday
-    ON
-        s.birthday_height = b_birthday.block_height
-        AND s.wallet_id = b_birthday.wallet_id
+LEFT JOIN tree_blocks AS b_synced ON s.last_scanned_tree_block_id = b_synced.id
+LEFT JOIN tree_blocks AS b_birthday ON s.birthday_block_id = b_birthday.id
 WHERE w.id = ?
 `
 
@@ -124,20 +118,14 @@ SELECT
     s.birthday_height,
     s.birthday_timestamp,
     s.updated_at,
-    b_synced.header_hash AS synced_block_hash,
+    b_synced.block_hash AS synced_block_hash,
     b_synced.block_timestamp AS synced_block_timestamp,
-    b_birthday.header_hash AS birthday_block_hash,
+    b_birthday.block_hash AS birthday_block_hash,
     b_birthday.block_timestamp AS birthday_block_timestamp
 FROM wallets AS w
 LEFT JOIN wallet_sync_states AS s ON w.id = s.wallet_id
-LEFT JOIN wallet_blocks AS b_synced
-    ON
-        s.synced_height = b_synced.block_height
-        AND s.wallet_id = b_synced.wallet_id
-LEFT JOIN wallet_blocks AS b_birthday
-    ON
-        s.birthday_height = b_birthday.block_height
-        AND s.wallet_id = b_birthday.wallet_id
+LEFT JOIN tree_blocks AS b_synced ON s.last_scanned_tree_block_id = b_synced.id
+LEFT JOIN tree_blocks AS b_birthday ON s.birthday_block_id = b_birthday.id
 WHERE w.wallet_name = ?
 `
 
@@ -276,20 +264,14 @@ SELECT
     s.birthday_height,
     s.birthday_timestamp,
     s.updated_at,
-    b_synced.header_hash AS synced_block_hash,
+    b_synced.block_hash AS synced_block_hash,
     b_synced.block_timestamp AS synced_block_timestamp,
-    b_birthday.header_hash AS birthday_block_hash,
+    b_birthday.block_hash AS birthday_block_hash,
     b_birthday.block_timestamp AS birthday_block_timestamp
 FROM wallets AS w
 LEFT JOIN wallet_sync_states AS s ON w.id = s.wallet_id
-LEFT JOIN wallet_blocks AS b_synced
-    ON
-        s.synced_height = b_synced.block_height
-        AND s.wallet_id = b_synced.wallet_id
-LEFT JOIN wallet_blocks AS b_birthday
-    ON
-        s.birthday_height = b_birthday.block_height
-        AND s.wallet_id = b_birthday.wallet_id
+LEFT JOIN tree_blocks AS b_synced ON s.last_scanned_tree_block_id = b_synced.id
+LEFT JOIN tree_blocks AS b_birthday ON s.birthday_block_id = b_birthday.id
 WHERE (
     ?1 IS NULL
     OR w.id > ?1
@@ -366,31 +348,50 @@ UPDATE wallet_sync_states
 SET
     synced_height = CASE
         WHEN
-            synced_height >= cast(?1 AS INTEGER)
+            last_scanned_tree_block_id = cast(?1 AS INTEGER)
             THEN cast(?2 AS INTEGER)
         ELSE synced_height
     END,
+    last_scanned_tree_block_id = CASE
+        WHEN last_scanned_tree_block_id = cast(?1 AS INTEGER)
+            THEN cast(?3 AS INTEGER)
+        ELSE last_scanned_tree_block_id
+    END,
     birthday_height = CASE
         WHEN
-            birthday_height = cast(?1 AS INTEGER)
+            birthday_block_id = cast(?1 AS INTEGER)
             THEN cast(?2 AS INTEGER)
         ELSE birthday_height
     END,
+    birthday_block_id = CASE
+        WHEN birthday_block_id = cast(?1 AS INTEGER)
+            THEN cast(?3 AS INTEGER)
+        ELSE birthday_block_id
+    END,
     updated_at = current_timestamp
 WHERE
-    wallet_id = cast(?3 AS INTEGER)
-    AND (synced_height >= cast(?1 AS INTEGER) OR birthday_height = cast(?1 AS INTEGER))
+    wallet_id = cast(?4 AS INTEGER)
+    AND (
+        last_scanned_tree_block_id = cast(?1 AS INTEGER)
+        OR birthday_block_id = cast(?1 AS INTEGER)
+    )
 `
 
 type RewindWalletReferencesForDisconnectParams struct {
-	Height         int64
-	PreviousHeight sql.NullInt64
-	WalletID       int64
+	OrphanID        int64
+	PreviousHeight  sql.NullInt64
+	PreviousBlockID sql.NullInt64
+	WalletID        int64
 }
 
 // Rewind scanned progress across removed history; move birthday only on removal.
 func (q *Queries) RewindWalletReferencesForDisconnect(ctx context.Context, arg RewindWalletReferencesForDisconnectParams) (int64, error) {
-	result, err := q.exec(ctx, q.rewindWalletReferencesForDisconnectStmt, RewindWalletReferencesForDisconnect, arg.Height, arg.PreviousHeight, arg.WalletID)
+	result, err := q.exec(ctx, q.rewindWalletReferencesForDisconnectStmt, RewindWalletReferencesForDisconnect,
+		arg.OrphanID,
+		arg.PreviousHeight,
+		arg.PreviousBlockID,
+		arg.WalletID,
+	)
 	if err != nil {
 		return 0, err
 	}
@@ -434,22 +435,26 @@ UPDATE wallet_sync_states
 SET
     -- If synced_height param is NOT NULL, use it. Otherwise, keep existing value.
     synced_height = coalesce(?1, synced_height),
+    last_scanned_tree_block_id = coalesce(?2, last_scanned_tree_block_id),
 
     -- If birthday_height param is NOT NULL, use it. Otherwise, keep existing value.
-    birthday_height = coalesce(?2, birthday_height),
+    birthday_height = coalesce(?3, birthday_height),
+    birthday_block_id = coalesce(?4, birthday_block_id),
 
     -- If birthday_timestamp param is NOT NULL, use it. Otherwise, keep existing value.
-    birthday_timestamp = coalesce(?3, birthday_timestamp),
+    birthday_timestamp = coalesce(?5, birthday_timestamp),
 
     -- Always update timestamp to current database time.
     updated_at = current_timestamp
 WHERE
-    wallet_id = ?4
+    wallet_id = ?6
 `
 
 type UpdateWalletSyncStateParams struct {
 	SyncedHeight      sql.NullInt64
+	SyncedBlockID     sql.NullInt64
 	BirthdayHeight    sql.NullInt64
+	BirthdayBlockID   sql.NullInt64
 	BirthdayTimestamp sql.NullTime
 	WalletID          int64
 }
@@ -457,7 +462,9 @@ type UpdateWalletSyncStateParams struct {
 func (q *Queries) UpdateWalletSyncState(ctx context.Context, arg UpdateWalletSyncStateParams) (int64, error) {
 	result, err := q.exec(ctx, q.updateWalletSyncStateStmt, UpdateWalletSyncState,
 		arg.SyncedHeight,
+		arg.SyncedBlockID,
 		arg.BirthdayHeight,
+		arg.BirthdayBlockID,
 		arg.BirthdayTimestamp,
 		arg.WalletID,
 	)

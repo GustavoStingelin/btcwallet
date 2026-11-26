@@ -2365,9 +2365,10 @@ func TestControllerTargetedScanFailureKeepsWorker(t *testing.T) {
 			WalletID:     w.id,
 			Transactions: []db.CreateTxParams{},
 			SyncedTo: &db.Block{
-				Hash:      block.Hash,
-				Height:    uint32(block.Height),
-				Timestamp: block.Time,
+				Hash:       block.Hash,
+				Height:     uint32(block.Height),
+				Timestamp:  block.Time,
+				ParentHash: tip.Hash,
 			},
 		}).Return(nil).Once()
 

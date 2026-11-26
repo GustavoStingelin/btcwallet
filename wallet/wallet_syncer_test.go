@@ -927,7 +927,7 @@ func TestResolveMissingHistoricalBlockTipMismatch(t *testing.T) {
 	).Once()
 
 	// Act: Resolve the missing historical block against the mismatched tip.
-	err := s.resolveMissingHistoricalBlock(listErr, tip)
+	err := s.resolveMissingHistoricalBlock(t.Context(), listErr, tip)
 
 	// Assert: The list error is returned without replacement.
 	require.Same(t, listErr, err)
@@ -950,7 +950,9 @@ func TestResolveMissingHistoricalBlockChainLookupError(t *testing.T) {
 	).Once()
 
 	// Act: Resolve the missing historical block.
-	err := s.resolveMissingHistoricalBlock(db.ErrBlockNotFound, tip)
+	err := s.resolveMissingHistoricalBlock(
+		t.Context(), db.ErrBlockNotFound, tip,
+	)
 
 	// Assert: The chain error has context and remains available to callers.
 	require.ErrorContains(t, err, "get synced block hash")
@@ -9645,8 +9647,9 @@ func TestSyncerDisconnectProvesHigherCheckpoint(t *testing.T) {
 func TestSyncerRetriesFailedDisconnect(t *testing.T) {
 	t.Parallel()
 
-	// Arrange: Scan old block two, then advance live progress to canonical
-	// three with its reward. Retry starts with a backend still catching up;
+	// Arrange: Scan old block two, then observe the canonical reward at
+	// three without advancing the checkpoint. Retry starts with a backend
+	// still catching up;
 	// its incomplete tip must not authorize removal of the higher reward.
 	base, _, id := newSQLScriptVault(t)
 	blocks := make([]db.Block, 4)
@@ -9666,7 +9669,7 @@ func TestSyncerRetriesFailedDisconnect(t *testing.T) {
 	reward := reorgCoinbase(t, 7)
 
 	require.NoError(t, base.ApplyTxBatch(t.Context(), db.TxBatchParams{
-		WalletID: id, SyncedTo: &blocks[3],
+		WalletID: id,
 		Transactions: []db.CreateTxParams{
 			{
 				WalletID: id, Tx: &reward.MsgTx, Block: &blocks[3],
@@ -9691,7 +9694,7 @@ func TestSyncerRetriesFailedDisconnect(t *testing.T) {
 	})
 	store.On("ListTxns", mock.Anything, db.ListTxnsQuery{
 		WalletID: id, StartHeight: 2, EndHeight: math.MaxInt32,
-	}).Return([]db.TxInfo(nil), nil).Once()
+	}).Return([]db.TxInfo{{Block: &blocks[3]}}, nil).Once()
 	store.On("ListTxns", mock.Anything, db.ListTxnsQuery{
 		WalletID: id, UnminedOnly: true,
 	}).Return([]db.TxInfo(nil), nil).Run(func(mock.Arguments) {
@@ -9710,7 +9713,7 @@ func TestSyncerRetriesFailedDisconnect(t *testing.T) {
 		}).Twice()
 	source.On("GetBestBlock").Return(&hashes[3], int32(3), nil).Once()
 	source.On("GetBestBlock").Return(&hashes[3], int32(3), nil).
-		Times(5).NotBefore(backendReady)
+		Times(7).NotBefore(backendReady)
 	source.On("GetBlockHash", int64(1)).Return(
 		(*chainhash.Hash)(nil), failure,
 	).Once()
@@ -9721,6 +9724,7 @@ func TestSyncerRetriesFailedDisconnect(t *testing.T) {
 	).Once()
 	source.On("GetBlockHashes", int64(0), int64(1)).Return(hashes[:2], nil).
 		Once()
+	expectDisconnectHeaders(source, 2, hashes[1], hashes[2:]...)
 	expectDisconnectHeaders(source, 2, hashes[1], hashes[2:]...)
 	source.On("GetBlockHashes", int64(2), int64(3)).Return(hashes[2:], nil).
 		Once()

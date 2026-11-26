@@ -111,14 +111,17 @@ CREATE TABLE wallet_sync_states (
     -- primary key, enforcing one-to-one relationship.
     wallet_id INTEGER PRIMARY KEY,
 
-    -- Current sync status of the wallet (references wallet_blocks table). NULL for wallets
+    -- Current sync status of the wallet. NULL for wallets
     -- that haven't synced any blocks yet.
     synced_height INTEGER,
 
-    -- Birthday block height of the wallet (references wallet_blocks table). NULL if the
+    last_scanned_tree_block_id INTEGER,
+
+    -- Birthday block height of the wallet. NULL if the
     -- wallet has no known birthday block. When set, indicates the block has been
     -- verified.
     birthday_height INTEGER,
+    birthday_block_id INTEGER,
 
     -- User-provided birthday timestamp for wallet rescan. NULL if not set.
     birthday_timestamp DATETIME,
@@ -132,13 +135,15 @@ CREATE TABLE wallet_sync_states (
 
     -- Foreign key constraint to blocks. Using ON DELETE RESTRICT to ensure
     -- that the block cannot be deleted if it is referenced by the sync state.
-    FOREIGN KEY (wallet_id, synced_height)
-    REFERENCES wallet_blocks (wallet_id, block_height)
+    CHECK ((last_scanned_tree_block_id IS NULL) = (synced_height IS NULL)),
+    FOREIGN KEY (last_scanned_tree_block_id, synced_height)
+    REFERENCES tree_blocks (id, block_height)
     ON DELETE RESTRICT,
 
     -- Foreign key constraint to blocks. Using ON DELETE RESTRICT to ensure
     -- that the block cannot be deleted if it is referenced by the sync state.
-    FOREIGN KEY (wallet_id, birthday_height)
-    REFERENCES wallet_blocks (wallet_id, block_height)
+    CHECK ((birthday_block_id IS NULL) = (birthday_height IS NULL)),
+    FOREIGN KEY (birthday_block_id, birthday_height)
+    REFERENCES tree_blocks (id, block_height)
     ON DELETE RESTRICT
 );

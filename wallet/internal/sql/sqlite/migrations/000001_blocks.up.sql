@@ -1,5 +1,3 @@
--- Wallet identity precedes owned block metadata so its foreign key can bind.
---
 -- Migration note: Intentionally NOT idempotent (no "IF NOT EXISTS").
 -- This ensures migration tracking stays accurate and fails loudly if run twice.
 CREATE TABLE wallets (
@@ -39,13 +37,14 @@ BEGIN
     SELECT raise(ABORT, 'wallet is_watch_only cannot be changed after creation');
 END;
 
--- Each Wallet retains its own chain view until its worker processes reorgs.
--- A replacement at one height must not overwrite another Wallet's history.
-CREATE TABLE wallet_blocks (
-    wallet_id INTEGER NOT NULL REFERENCES wallets (id) ON DELETE RESTRICT,
+-- A block's hash identifies it even when competing forks share a height.
+CREATE TABLE tree_blocks (
+    id INTEGER PRIMARY KEY,
+    block_hash BLOB NOT NULL UNIQUE CHECK (length(block_hash) = 32),
     block_height INTEGER NOT NULL CHECK (block_height >= 0),
-    header_hash BLOB NOT NULL CHECK (length(header_hash) = 32),
     block_timestamp INTEGER NOT NULL CHECK (block_timestamp >= 0),
-    PRIMARY KEY (wallet_id, block_height),
-    UNIQUE (wallet_id, header_hash)
+    parent_id INTEGER REFERENCES tree_blocks (id),
+    UNIQUE (id, block_height)
 );
+
+CREATE INDEX idx_tree_blocks_height ON tree_blocks (block_height);

@@ -106,11 +106,20 @@ type Transaction struct {
 	TxHash         []byte
 	RawTx          []byte
 	BlockHeight    sql.NullInt32
+	TreeBlockID    sql.NullInt64
 	ConfirmedOrder sql.NullInt64
 	TxStatus       int16
 	ReceivedTime   time.Time
 	IsCoinbase     bool
 	TxLabel        string
+}
+
+type TreeBlock struct {
+	ID             int64
+	BlockHash      []byte
+	BlockHeight    int64
+	BlockTimestamp int64
+	ParentID       sql.NullInt64
 }
 
 type TxInput struct {
@@ -153,13 +162,6 @@ type Wallet struct {
 	MasterHdPubKey []byte
 }
 
-type WalletBlock struct {
-	WalletID       int64
-	BlockHeight    int32
-	HeaderHash     []byte
-	BlockTimestamp int64
-}
-
 type WalletSecret struct {
 	WalletID                 int64
 	MasterPrivParams         []byte
@@ -169,9 +171,11 @@ type WalletSecret struct {
 }
 
 type WalletSyncState struct {
-	WalletID          int64
-	SyncedHeight      sql.NullInt32
-	BirthdayHeight    sql.NullInt32
-	BirthdayTimestamp sql.NullTime
-	UpdatedAt         time.Time
+	WalletID               int64
+	SyncedHeight           sql.NullInt32
+	LastScannedTreeBlockID sql.NullInt64
+	BirthdayHeight         sql.NullInt32
+	BirthdayBlockID        sql.NullInt64
+	BirthdayTimestamp      sql.NullTime
+	UpdatedAt              time.Time
 }

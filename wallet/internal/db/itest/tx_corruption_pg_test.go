@@ -93,8 +93,9 @@ func forceRollbackBlockDeleteFailure(t *testing.T, store *pgTestStore,
 			"BEGIN RAISE EXCEPTION " +
 			"'forced rollback block delete failure'; END; $$",
 		fmt.Sprintf("CREATE TRIGGER fail_rollback_block_delete "+
-			"BEFORE DELETE ON wallet_blocks FOR EACH ROW "+
-			"WHEN (old.wallet_id = %d) EXECUTE FUNCTION "+
+			"BEFORE UPDATE OF block_height ON transactions FOR EACH ROW "+
+			"WHEN (old.wallet_id = %d AND old.block_height IS NOT NULL "+
+			"AND new.block_height IS NULL) EXECUTE FUNCTION "+
 			"fail_rollback_block_delete()", walletID),
 	}
 	for _, stmt := range statements {
@@ -114,29 +115,29 @@ func corruptTransactionBlockHeight(t *testing.T, store *pgTestStore,
 
 	_, err := store.DB().ExecContext(
 		t.Context(),
-		"ALTER TABLE wallet_blocks DROP CONSTRAINT IF EXISTS "+
-			"wallet_blocks_block_height_check",
+		"ALTER TABLE tree_blocks DROP CONSTRAINT IF EXISTS "+
+			"tree_blocks_block_height_check",
 	)
 	require.NoError(t, err)
 
 	blockHash := RandomHash()
-	_, err = store.DB().ExecContext(
+
+	var blockID int64
+
+	err = store.DB().QueryRowContext(
 		t.Context(),
-		"INSERT INTO wallet_blocks "+
-			"(wallet_id, block_height, header_hash, block_timestamp) "+
-			"VALUES ($1, $2, $3, $4) "+
-			"ON CONFLICT (wallet_id, block_height) DO UPDATE SET "+
-			"header_hash = EXCLUDED.header_hash, "+
-			"block_timestamp = EXCLUDED.block_timestamp",
-		int64(walletID), height, blockHash[:], time.Now().Unix(),
-	)
+		"INSERT INTO tree_blocks "+
+			"(block_height, block_hash, block_timestamp) "+
+			"VALUES ($1, $2, $3) RETURNING id",
+		height, blockHash[:], time.Now().Unix(),
+	).Scan(&blockID)
 	require.NoError(t, err)
 
 	result, err := store.DB().ExecContext(
 		t.Context(),
-		"UPDATE transactions SET block_height = $1 "+
-			"WHERE wallet_id = $2 AND tx_hash = $3",
-		height, int64(walletID), txHash[:],
+		"UPDATE transactions SET block_height = $1, tree_block_id = $2 "+
+			"WHERE wallet_id = $3 AND tx_hash = $4",
+		height, blockID, int64(walletID), txHash[:],
 	)
 	require.NoError(t, err)
 

@@ -33,6 +33,7 @@ type updateTxOps struct {
 	// blockHeight caches the validated sqlite block-height wrapper prepared for
 	// the later state update query.
 	blockHeight sql.NullInt64
+	blockID     sql.NullInt64
 
 	// status caches the sqlite status code prepared for the later state update
 	// query.
@@ -75,17 +76,21 @@ func (o *updateTxOps) LoadIsCoinbase(ctx context.Context,
 // PrepareState validates any referenced confirming block and captures the
 // sqlite-specific state params for the later row update.
 func (o *updateTxOps) PrepareState(ctx context.Context,
-	walletID uint32, state db.UpdateTxState) error {
+	_ uint32, state db.UpdateTxState) error {
 
 	blockHeight := sql.NullInt64{}
+	o.blockID = sql.NullInt64{}
 
 	if state.Block != nil {
-		height, err := requireBlockMatches(ctx, o.qtx, walletID, state.Block)
+		id, err := requireBlockMatches(ctx, o.qtx, state.Block)
 		if err != nil {
 			return fmt.Errorf("require confirming block: %w", err)
 		}
 
-		blockHeight = sql.NullInt64{Int64: height, Valid: true}
+		blockHeight = sql.NullInt64{
+			Int64: int64(state.Block.Height), Valid: true,
+		}
+		o.blockID = sql.NullInt64{Int64: id, Valid: true}
 	}
 
 	o.blockHeight = blockHeight
@@ -152,6 +157,7 @@ func (o *updateTxOps) UpdateState(ctx context.Context, walletID uint32,
 		ctx,
 		sqlc.UpdateTransactionStateByHashParams{
 			BlockHeight: o.blockHeight,
+			BlockID:     o.blockID,
 			Status:      o.status,
 			WalletID:    int64(walletID),
 			TxHash:      txHash[:],

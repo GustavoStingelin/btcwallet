@@ -26,9 +26,11 @@ UPDATE wallet_sync_states
 SET
     -- If synced_height param is NOT NULL, use it. Otherwise, keep existing value.
     synced_height = coalesce(sqlc.narg('synced_height'), synced_height),
+    last_scanned_tree_block_id = coalesce(sqlc.narg('synced_block_id'), last_scanned_tree_block_id),
 
     -- If birthday_height param is NOT NULL, use it. Otherwise, keep existing value.
     birthday_height = coalesce(sqlc.narg('birthday_height'), birthday_height),
+    birthday_block_id = coalesce(sqlc.narg('birthday_block_id'), birthday_block_id),
 
     -- If birthday_timestamp param is NOT NULL, use it. Otherwise, keep existing value.
     birthday_timestamp = coalesce(sqlc.narg('birthday_timestamp'), birthday_timestamp),
@@ -50,20 +52,14 @@ SELECT
     s.birthday_height,
     s.birthday_timestamp,
     s.updated_at,
-    b_synced.header_hash AS synced_block_hash,
+    b_synced.block_hash AS synced_block_hash,
     b_synced.block_timestamp AS synced_block_timestamp,
-    b_birthday.header_hash AS birthday_block_hash,
+    b_birthday.block_hash AS birthday_block_hash,
     b_birthday.block_timestamp AS birthday_block_timestamp
 FROM wallets AS w
 LEFT JOIN wallet_sync_states AS s ON w.id = s.wallet_id
-LEFT JOIN wallet_blocks AS b_synced
-    ON
-        s.synced_height = b_synced.block_height
-        AND s.wallet_id = b_synced.wallet_id
-LEFT JOIN wallet_blocks AS b_birthday
-    ON
-        s.birthday_height = b_birthday.block_height
-        AND s.wallet_id = b_birthday.wallet_id
+LEFT JOIN tree_blocks AS b_synced ON s.last_scanned_tree_block_id = b_synced.id
+LEFT JOIN tree_blocks AS b_birthday ON s.birthday_block_id = b_birthday.id
 WHERE w.wallet_name = $1;
 
 -- name: ListWallets :many
@@ -81,20 +77,14 @@ SELECT
     s.birthday_height,
     s.birthday_timestamp,
     s.updated_at,
-    b_synced.header_hash AS synced_block_hash,
+    b_synced.block_hash AS synced_block_hash,
     b_synced.block_timestamp AS synced_block_timestamp,
-    b_birthday.header_hash AS birthday_block_hash,
+    b_birthday.block_hash AS birthday_block_hash,
     b_birthday.block_timestamp AS birthday_block_timestamp
 FROM wallets AS w
 LEFT JOIN wallet_sync_states AS s ON w.id = s.wallet_id
-LEFT JOIN wallet_blocks AS b_synced
-    ON
-        s.synced_height = b_synced.block_height
-        AND s.wallet_id = b_synced.wallet_id
-LEFT JOIN wallet_blocks AS b_birthday
-    ON
-        s.birthday_height = b_birthday.block_height
-        AND s.wallet_id = b_birthday.wallet_id
+LEFT JOIN tree_blocks AS b_synced ON s.last_scanned_tree_block_id = b_synced.id
+LEFT JOIN tree_blocks AS b_birthday ON s.birthday_block_id = b_birthday.id
 WHERE (
     sqlc.narg('cursor_id')::BIGINT IS NULL
     OR w.id > sqlc.narg('cursor_id')::BIGINT
@@ -114,20 +104,14 @@ SELECT
     s.birthday_height,
     s.birthday_timestamp,
     s.updated_at,
-    b_synced.header_hash AS synced_block_hash,
+    b_synced.block_hash AS synced_block_hash,
     b_synced.block_timestamp AS synced_block_timestamp,
-    b_birthday.header_hash AS birthday_block_hash,
+    b_birthday.block_hash AS birthday_block_hash,
     b_birthday.block_timestamp AS birthday_block_timestamp
 FROM wallets AS w
 LEFT JOIN wallet_sync_states AS s ON w.id = s.wallet_id
-LEFT JOIN wallet_blocks AS b_synced
-    ON
-        s.synced_height = b_synced.block_height
-        AND s.wallet_id = b_synced.wallet_id
-LEFT JOIN wallet_blocks AS b_birthday
-    ON
-        s.birthday_height = b_birthday.block_height
-        AND s.wallet_id = b_birthday.wallet_id
+LEFT JOIN tree_blocks AS b_synced ON s.last_scanned_tree_block_id = b_synced.id
+LEFT JOIN tree_blocks AS b_birthday ON s.birthday_block_id = b_birthday.id
 WHERE w.id = $1;
 
 -- name: InsertWalletSecrets :exec
@@ -165,14 +149,25 @@ WHERE wallet_id = $5;
 UPDATE wallet_sync_states
 SET
     synced_height = CASE
-        WHEN synced_height >= sqlc.arg('height')::BIGINT THEN sqlc.narg('previous_height')::INTEGER
+        WHEN last_scanned_tree_block_id = sqlc.arg('orphan_id')::BIGINT THEN sqlc.narg('previous_height')::INTEGER
         ELSE synced_height
     END,
+    last_scanned_tree_block_id = CASE
+        WHEN last_scanned_tree_block_id = sqlc.arg('orphan_id')::BIGINT THEN sqlc.narg('previous_block_id')::BIGINT
+        ELSE last_scanned_tree_block_id
+    END,
     birthday_height = CASE
-        WHEN birthday_height = sqlc.arg('height')::BIGINT THEN sqlc.narg('previous_height')::INTEGER
+        WHEN birthday_block_id = sqlc.arg('orphan_id')::BIGINT THEN sqlc.narg('previous_height')::INTEGER
         ELSE birthday_height
+    END,
+    birthday_block_id = CASE
+        WHEN birthday_block_id = sqlc.arg('orphan_id')::BIGINT THEN sqlc.narg('previous_block_id')::BIGINT
+        ELSE birthday_block_id
     END,
     updated_at = current_timestamp AT TIME ZONE 'UTC'
 WHERE
     wallet_id = sqlc.arg('wallet_id')::BIGINT
-    AND (synced_height >= sqlc.arg('height')::BIGINT OR birthday_height = sqlc.arg('height')::BIGINT);
+    AND (
+        last_scanned_tree_block_id = sqlc.arg('orphan_id')::BIGINT
+        OR birthday_block_id = sqlc.arg('orphan_id')::BIGINT
+    );

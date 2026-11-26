@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"maps"
 	"math"
 	"slices"
 	"time"
@@ -1572,15 +1571,13 @@ type disconnectDescendantOps interface {
 }
 
 // RollbackToBlockOps adapts one SQL backend to the full RollbackToBlock
-// sequence, including sync-state rewinds, block deletion, and descendant
+// sequence, including sync-state rewinds, confirmation detach, and descendant
 // invalidation.
 //
 // The shared rollback algorithm is intentionally ordered:
-//   - collect rollback root hashes before block rows are removed
-//   - rewind sync-state heights that still point at the removed blocks
-//   - delete the owning Wallet block rows at or above the rollback height
-//   - mark the disconnected coinbase roots orphaned once their confirming
-//     blocks have been removed
+//   - collect rollback root hashes before confirmations are detached
+//   - rewind affected sync-state references
+//   - detach the Wallet's confirmations at or above the rollback height
 //   - walk the disconnected roots and invalidate dependent descendants
 //
 // The adapter methods map directly to those stages so the shared helper can own
@@ -1592,15 +1589,15 @@ type RollbackToBlockOps interface {
 		height uint32) (map[uint32][]chainhash.Hash, error)
 
 	// RewindWalletSyncStateHeights clamps wallet sync-state references
-	// below the rollback boundary before block rows are removed.
+	// below the rollback boundary.
 	RewindWalletSyncStateHeights(ctx context.Context, height uint32) error
 
-	// DeleteBlocksAtOrAboveHeight removes owned block rows at or above
-	// the rollback boundary after sync-state references have been rewound.
+	// DeleteBlocksAtOrAboveHeight detaches the Wallet's confirmations at or
+	// above the rollback boundary. The shared block rows stay intact.
 	DeleteBlocksAtOrAboveHeight(ctx context.Context, height uint32) error
 
 	// MarkTxRootsOrphaned rewrites the disconnected coinbase roots to the
-	// orphaned state after their confirming blocks are deleted.
+	// orphaned state after their confirmations are detached.
 	MarkTxRootsOrphaned(ctx context.Context, walletID uint32,
 		rootHashes []chainhash.Hash) error
 
@@ -1845,9 +1842,8 @@ func MarkTxRootsOrphaned(ctx context.Context,
 // RollbackToBlockWithOps runs the shared RollbackToBlock sequence inside one
 // backend-specific SQL transaction.
 //
-// The helper rewinds sync-state heights before deleting blocks, then clears and
-// fails any now-invalid unmined descendants rooted in disconnected coinbase
-// history so rollback cannot leave dangling references behind.
+// Rewind sync state, detach affected confirmations, and fail now-invalid
+// unmined descendants of disconnected coinbases in the same transaction.
 func RollbackToBlockWithOps(ctx context.Context, height uint32,
 	ops RollbackToBlockOps) error {
 
@@ -1880,7 +1876,6 @@ func RollbackToBlockWithOps(ctx context.Context, height uint32,
 }
 
 // DisconnectTx carries only the persisted facts used by disconnect policy.
-// IsCoinbase matches the classification used by confirmation-delete triggers.
 type DisconnectTx struct {
 	BlockHeight uint32
 	BlockHash   chainhash.Hash
@@ -1910,11 +1905,11 @@ type DisconnectBlockOps interface {
 
 	// RewindDisconnectReferences rewinds progress across selected orphan rows
 	// and moves birthday only when its own block is removed.
-	RewindDisconnectReferences(ctx context.Context, heights []uint32,
+	RewindDisconnectReferences(ctx context.Context, orphaned []Block,
 		previous *Block) error
 
-	// DeleteDisconnectBlocks removes exact rows after reference rewind.
-	DeleteDisconnectBlocks(ctx context.Context, heights []uint32) error
+	// DetachDisconnectBlocks clears only confirmations on orphaned identities.
+	DetachDisconnectBlocks(ctx context.Context, orphaned []Block) error
 }
 
 // DisconnectBlockWithOps validates native evidence and removes only proven
@@ -1940,35 +1935,57 @@ func DisconnectBlockWithOps(ctx context.Context, walletID uint32, block Block,
 		return err
 	}
 
-	if stored != nil && stored.Hash != block.Hash {
-		return nil
-	}
-
 	return disconnectStoredHistory(
 		ctx, walletID, block.Height, stored, previous, canonical, ops,
 	)
 }
 
-// selectDisconnectHistory classifies each owned block identity once, so exact
-// deletion and coinbase descendant invalidation use the same orphan decision.
+// ReconcileAheadConfirmationsWithOps detaches observations not covered by the
+// scan checkpoint. Neither the checkpoint nor the shared tree is changed.
+func ReconcileAheadConfirmationsWithOps(ctx context.Context, walletID,
+	start uint32, canonical map[uint32]*chainhash.Hash,
+	ops DisconnectBlockOps) error {
+
+	history, err := ops.ListDisconnectTransactions(ctx, start)
+	if err != nil {
+		return err
+	}
+
+	orphaned, roots, err := selectDisconnectHistory(
+		walletID, nil, history, canonical,
+	)
+	if err != nil {
+		return err
+	}
+
+	err = ops.DetachDisconnectBlocks(ctx, orphaned)
+	if err != nil {
+		return err
+	}
+
+	return invalidateRollbackDescendants(ctx, roots, ops)
+}
+
+// selectDisconnectHistory classifies each referenced block identity once, so
+// detachment and coinbase invalidation use the same orphan decision.
 func selectDisconnectHistory(walletID uint32, blocks []Block,
 	history []DisconnectTx, canonical map[uint32]*chainhash.Hash) (
-	[]uint32, map[uint32][]chainhash.Hash, error) {
+	[]Block, map[uint32][]chainhash.Hash, error) {
 
-	// Mined observations can lie outside committed progress. Their owned
-	// block join guarantees the same identity as any committed row here.
-	orphaned := make(map[uint32]chainhash.Hash)
+	// A mined observation can be ahead of or compete with the scanned branch.
+	orphaned := make(map[chainhash.Hash]uint32)
 	for _, block := range blocks {
-		orphaned[block.Height] = block.Hash
+		orphaned[block.Hash] = block.Height
 	}
 
 	for _, info := range history {
-		orphaned[info.BlockHeight] = info.BlockHash
+		orphaned[info.BlockHash] = info.BlockHeight
 	}
 
 	// Validate the union before any mutation. Matching rows leave the selected
 	// set, while an explicit nil proves absence above the source's tip.
-	for height, stored := range orphaned {
+	chosen := make([]Block, 0, len(orphaned))
+	for stored, height := range orphaned {
 		hash, known := canonical[height]
 		if !known {
 			return nil, nil, fmt.Errorf("unknown canonical block at %d: %w",
@@ -1976,20 +1993,23 @@ func selectDisconnectHistory(walletID uint32, blocks []Block,
 		}
 
 		if hash != nil && *hash == stored {
-			delete(orphaned, height)
+			delete(orphaned, stored)
+			continue
 		}
+
+		chosen = append(chosen, Block{Hash: stored, Height: height})
 	}
 
 	roots := make(map[uint32][]chainhash.Hash)
 	for _, info := range history {
-		if _, removed := orphaned[info.BlockHeight]; removed &&
+		if _, removed := orphaned[info.BlockHash]; removed &&
 			info.IsCoinbase {
 
 			roots[walletID] = append(roots[walletID], info.Hash)
 		}
 	}
 
-	return slices.Collect(maps.Keys(orphaned)), roots, nil
+	return chosen, roots, nil
 }
 
 // disconnectStoredHistory validates all required evidence before writes. Its
@@ -2024,32 +2044,31 @@ func disconnectStoredHistory(ctx context.Context, walletID uint32,
 		return err
 	}
 
-	// An empty observed row may lie above scanned progress. Only an
-	// actual stored identity belongs in the set considered for deletion.
+	// The event alone does not prove that the Wallet references the block.
 	if stored != nil {
 		blocks = append(blocks, *stored)
 	}
 
-	heights, roots, err := selectDisconnectHistory(
+	orphaned, roots, err := selectDisconnectHistory(
 		walletID, blocks, history, canonical,
 	)
 	if err != nil {
 		return err
 	}
 
-	if len(heights) == 0 {
+	if len(orphaned) == 0 {
 		return nil
 	}
 
 	return rewindDisconnectHistory(
-		ctx, observed, previous, heights, roots, ops,
+		ctx, observed, previous, orphaned, roots, ops,
 	)
 }
 
 // rewindDisconnectHistory verifies the fork before moving references and
 // removing selected orphans and their descendants in the same transaction.
 func rewindDisconnectHistory(ctx context.Context, observed uint32,
-	previous *Block, heights []uint32, roots map[uint32][]chainhash.Hash,
+	previous *Block, orphaned []Block, roots map[uint32][]chainhash.Hash,
 	ops DisconnectBlockOps) error {
 
 	// A height is enough to update the reference only after this transaction
@@ -2073,14 +2092,12 @@ func rewindDisconnectHistory(ctx context.Context, observed uint32,
 		}
 	}
 
-	// References must move before any delete can fire confirmation triggers.
-	// All selected rows and their descendant effects share this same write.
-	err := ops.RewindDisconnectReferences(ctx, heights, previous)
+	err := ops.RewindDisconnectReferences(ctx, orphaned, previous)
 	if err != nil {
 		return err
 	}
 
-	err = ops.DeleteDisconnectBlocks(ctx, heights)
+	err = ops.DetachDisconnectBlocks(ctx, orphaned)
 	if err != nil {
 		return err
 	}

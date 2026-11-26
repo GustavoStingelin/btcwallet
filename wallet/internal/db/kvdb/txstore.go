@@ -2369,6 +2369,20 @@ func nonNegativeInt32ToUint32(value int32) uint32 {
 	return uint32(value)
 }
 
+// ListAheadConfirmationHeights leaves legacy restart recovery unchanged.
+func (s *Store) ListAheadConfirmationHeights(context.Context, uint32,
+	int32) ([]uint32, error) {
+
+	return nil, nil
+}
+
+// ReconcileAheadConfirmations is unused by legacy KVDB recovery.
+func (s *Store) ReconcileAheadConfirmations(context.Context, uint32, uint32,
+	map[uint32]*chainhash.Hash) error {
+
+	return nil
+}
+
 // DisconnectBlock reconciles matching history in one write and restores live
 // manager caches on failure, independently of the manager's progress.
 // previous is the complete retained canonical stamp; nil resets a matching

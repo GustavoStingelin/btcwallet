@@ -320,7 +320,7 @@ func applyBatchSyncTip(ctx context.Context, qtx *sqlc.Queries,
 		return fmt.Errorf("ensure synced block: %w", err)
 	}
 
-	syncParams, err := buildUpdateSyncParams(db.UpdateWalletParams{
+	syncParams, err := buildUpdateSyncParams(ctx, qtx, db.UpdateWalletParams{
 		WalletID: params.WalletID,
 		SyncedTo: params.SyncedTo,
 	})

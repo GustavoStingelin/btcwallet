@@ -15,6 +15,7 @@ INSERT INTO transactions (
     tx_hash,
     raw_tx,
     block_height,
+    tree_block_id,
     confirmed_order,
     tx_status,
     received_time,
@@ -25,6 +26,7 @@ INSERT INTO transactions (
     sqlc.arg('tx_hash'),
     sqlc.arg('raw_tx'),
     cast(sqlc.narg('block_height') AS INTEGER),
+    sqlc.narg('block_id'),
     CASE
         WHEN cast(sqlc.narg('block_height') AS INTEGER) IS NULL THEN NULL
         ELSE (
@@ -72,16 +74,13 @@ SELECT
     t.raw_tx,
     t.received_time,
     t.block_height,
-    b.header_hash AS block_hash,
+    b.block_hash,
     b.block_timestamp,
     t.is_coinbase,
     t.tx_status,
     t.tx_label
 FROM transactions AS t
-LEFT JOIN wallet_blocks AS b
-    ON
-        t.block_height = b.block_height
-        AND t.wallet_id = b.wallet_id
+LEFT JOIN tree_blocks AS b ON t.tree_block_id = b.id
 WHERE t.wallet_id = ? AND t.tx_hash = ?;
 
 -- name: ListTransactionsWithoutBlock :many
@@ -92,7 +91,7 @@ WHERE t.wallet_id = ? AND t.tx_hash = ?;
 -- - Includes the active unmined set (`pending` and `published`) together with
 --   retained invalid history such as `failed`, `replaced`, or `orphaned`
 --   rows.
--- - Projects typed NULL block metadata through `LEFT JOIN wallet_blocks AS b ON 1 = 0`
+-- - Projects typed NULL block metadata through `LEFT JOIN tree_blocks AS b ON 1 = 0`
 --   so sqlc preserves the nullable block columns while the row shape stays
 --   aligned with the confirmed query below.
 -- Performance:
@@ -103,13 +102,13 @@ SELECT
     t.raw_tx,
     t.received_time,
     t.block_height,
-    b.header_hash AS block_hash,
+    b.block_hash,
     b.block_timestamp,
     t.is_coinbase,
     t.tx_status,
     t.tx_label
 FROM transactions AS t
-LEFT JOIN wallet_blocks AS b ON 1 = 0
+LEFT JOIN tree_blocks AS b ON 1 = 0
 WHERE
     t.wallet_id = ?
     AND t.block_height IS NULL
@@ -123,7 +122,7 @@ ORDER BY t.received_time DESC, t.id DESC;
 --   in unmined `pending` or `published` status.
 -- - Excludes orphaned/replaced/failed history so delete and rollback logic do
 --   not treat retained invalid rows as active mempool spends.
--- - Projects typed NULL block metadata through `LEFT JOIN wallet_blocks AS b ON 1 = 0`
+-- - Projects typed NULL block metadata through `LEFT JOIN tree_blocks AS b ON 1 = 0`
 --   so sqlc preserves the nullable block columns while the row shape stays
 --   aligned with other transaction queries.
 -- Performance:
@@ -135,13 +134,13 @@ SELECT
     t.raw_tx,
     t.received_time,
     t.block_height,
-    b.header_hash AS block_hash,
+    b.block_hash,
     b.block_timestamp,
     t.is_coinbase,
     t.tx_status,
     t.tx_label
 FROM transactions AS t
-LEFT JOIN wallet_blocks AS b ON 1 = 0
+LEFT JOIN tree_blocks AS b ON 1 = 0
 WHERE
     t.wallet_id = ?
     AND t.block_height IS NULL
@@ -165,16 +164,13 @@ SELECT
     t.raw_tx,
     t.received_time,
     t.block_height,
-    b.header_hash AS block_hash,
+    b.block_hash,
     b.block_timestamp,
     t.is_coinbase,
     t.tx_status,
     t.tx_label
 FROM transactions AS t
-INNER JOIN wallet_blocks AS b
-    ON
-        t.block_height = b.block_height
-        AND t.wallet_id = b.wallet_id
+INNER JOIN tree_blocks AS b ON t.tree_block_id = b.id
 WHERE
     t.wallet_id = sqlc.arg('wallet_id')
     AND t.block_height >= cast(sqlc.arg('start_height') AS INTEGER)
@@ -264,7 +260,7 @@ SET
     confirmed_order = CASE
         WHEN cast(sqlc.narg('block_height') AS INTEGER) IS NULL THEN NULL
         WHEN
-            transactions.block_height = cast(sqlc.narg('block_height') AS INTEGER)
+            transactions.tree_block_id = sqlc.narg('block_id')
             AND transactions.confirmed_order IS NOT NULL
             THEN transactions.confirmed_order
         ELSE (
@@ -273,6 +269,7 @@ SET
         )
     END,
     block_height = cast(sqlc.narg('block_height') AS INTEGER),
+    tree_block_id = sqlc.narg('block_id'),
     tx_status = sqlc.arg('status')
 WHERE
     transactions.wallet_id = sqlc.arg('wallet_id')
@@ -355,47 +352,28 @@ WHERE
 ORDER BY wallet_id, id;
 
 -- name: RewindWalletSyncStateHeightsForRollback :execrows
--- Rewrites wallet sync-state heights so they stop referencing blocks that are
--- about to be deleted during RollbackToBlock.
---
--- How:
--- - Computes the greatest stored block below the rollback boundary.
--- - Rewrites both synced_height and birthday_height in one statement so the
---   subsequent block delete does not violate `ON DELETE RESTRICT`.
--- - Example: if `rollback_height = 195`, affected sync heights rewind to the
---   greatest stored block below 195, not necessarily 194 on sparse block tables.
--- - If there is no stored block below the boundary, the sync state no longer
---   points at any surviving block row.
--- Performance:
--- - Touches only wallet_sync_states rows whose heights are at or above the
---   rollback boundary.
+-- Move affected references to the caller-selected retained Wallet block.
 UPDATE wallet_sync_states
 SET
     synced_height = CASE
-        WHEN
-            synced_height IS NOT NULL
-            AND synced_height >= cast(sqlc.arg('rollback_height') AS INTEGER)
-            THEN (
-                SELECT max(block_height)
-                FROM wallet_blocks
-                WHERE
-                    wallet_id = cast(sqlc.arg('wallet_id') AS INTEGER)
-                    AND block_height < cast(sqlc.arg('rollback_height') AS INTEGER)
-            )
+        WHEN synced_height >= cast(sqlc.arg('rollback_height') AS INTEGER)
+            THEN cast(sqlc.narg('previous_height') AS INTEGER)
         ELSE synced_height
     END,
+    last_scanned_tree_block_id = CASE
+        WHEN synced_height >= cast(sqlc.arg('rollback_height') AS INTEGER)
+            THEN cast(sqlc.narg('previous_block_id') AS INTEGER)
+        ELSE last_scanned_tree_block_id
+    END,
     birthday_height = CASE
-        WHEN
-            birthday_height IS NOT NULL
-            AND birthday_height >= cast(sqlc.arg('rollback_height') AS INTEGER)
-            THEN (
-                SELECT max(block_height)
-                FROM wallet_blocks
-                WHERE
-                    wallet_id = cast(sqlc.arg('wallet_id') AS INTEGER)
-                    AND block_height < cast(sqlc.arg('rollback_height') AS INTEGER)
-            )
+        WHEN birthday_height >= cast(sqlc.arg('rollback_height') AS INTEGER)
+            THEN cast(sqlc.narg('previous_height') AS INTEGER)
         ELSE birthday_height
+    END,
+    birthday_block_id = CASE
+        WHEN birthday_height >= cast(sqlc.arg('rollback_height') AS INTEGER)
+            THEN cast(sqlc.narg('previous_block_id') AS INTEGER)
+        ELSE birthday_block_id
     END,
     updated_at = current_timestamp
 WHERE
@@ -412,15 +390,13 @@ WHERE
     );
 
 -- name: DeleteBlocksAtOrAboveHeight :execrows
--- Deletes blocks at and after the provided height.
---
--- How:
--- - Deletes only the owning Wallet range in wallet_blocks.
--- - Relies on FK/trigger side effects to null transaction block references and
---   orphan coinbase rows.
--- Performance:
--- - Executes as a range delete over the block-height primary key.
-DELETE FROM wallet_blocks
+-- Explicit height rollback detaches Wallet confirmations, not shared blocks.
+UPDATE transactions
+SET
+    block_height = NULL,
+    tree_block_id = NULL,
+    confirmed_order = NULL,
+    tx_status = CASE WHEN is_coinbase THEN 4 ELSE tx_status END
 WHERE
     wallet_id = cast(sqlc.arg('wallet_id') AS INTEGER)
     AND block_height >= cast(sqlc.arg('rollback_height') AS INTEGER);

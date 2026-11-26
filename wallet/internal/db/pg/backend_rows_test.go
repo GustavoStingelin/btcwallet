@@ -231,7 +231,8 @@ func TestPgCreateTxOpsAdditionalBranches(t *testing.T) {
 		dest, ok := args.Get(0).([]any)
 		require.True(t, ok)
 		require.NoError(t, scanValues([]any{
-			int32(block.Height), block.Hash[:], block.Timestamp.Unix(),
+			int64(1), block.Hash[:], int64(block.Height),
+			block.Timestamp.Unix(), sql.NullInt64{},
 		}, dest))
 	}).Return(nil).Once()
 

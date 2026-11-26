@@ -580,6 +580,17 @@ type TxStore interface {
 	// its hash in the same write that changes Wallet history.
 	DisconnectBlock(ctx context.Context, walletID uint32, block Block,
 		previous *Block, canonical map[uint32]*chainhash.Hash) error
+
+	// ListAheadConfirmationHeights lists heights with confirmations not
+	// covered by checkpointHeight. Legacy KVDB does not expose this view.
+	ListAheadConfirmationHeights(ctx context.Context, walletID uint32,
+		checkpointHeight int32) ([]uint32, error)
+
+	// ReconcileAheadConfirmations detaches confirmations above the checkpoint
+	// that are absent from the proven branch, without moving either checkpoint
+	// or birthday. Missing proof aborts the write; a nil hash proves absence.
+	ReconcileAheadConfirmations(ctx context.Context, walletID, start uint32,
+		canonical map[uint32]*chainhash.Hash) error
 }
 
 // UTXOStore defines the database actions for managing the UTXO set.

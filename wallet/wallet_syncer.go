@@ -563,7 +563,7 @@ func (s *syncer) checkRollback(ctx context.Context) error {
 			db.ErrBlockNotFound)
 	}
 
-	return nil
+	return s.reconcileAheadConfirmations(ctx, syncedTo)
 }
 
 // checkRollbackBatch compares one recorded range within the remote tip;
@@ -583,7 +583,7 @@ func (s *syncer) checkRollbackBatch(ctx context.Context,
 		ctx, startHeight, endHeight,
 	)
 	if err != nil {
-		return 0, true, s.resolveMissingHistoricalBlock(err, syncedTo)
+		return 0, true, s.resolveMissingHistoricalBlock(ctx, err, syncedTo)
 	}
 
 	// A shorter current branch cannot serve hashes above its own tip.
@@ -611,7 +611,7 @@ func (s *syncer) checkRollbackBatch(ctx context.Context,
 	if endHeight == syncedTo.Height && bestHeight >= syncedTo.Height &&
 		matchIndex == len(localHashes)-1 {
 
-		return 0, true, nil
+		return 0, true, s.reconcileAheadConfirmations(ctx, syncedTo)
 	}
 
 	// The common ancestor lies deeper, so continue below this entire batch.
@@ -648,10 +648,10 @@ func (s *syncer) checkRollbackBatch(ctx context.Context,
 		fork, source)
 }
 
-// resolveMissingHistoricalBlock accepts a missing historical block when the
-// persisted synced tip matches the chain backend.
-func (s *syncer) resolveMissingHistoricalBlock(listErr error,
-	syncedTo waddrmgr.BlockStamp) error {
+// resolveMissingHistoricalBlock accepts pruned history only when the saved
+// tip matches the chain backend. Sparse observations still need proof.
+func (s *syncer) resolveMissingHistoricalBlock(ctx context.Context,
+	listErr error, syncedTo waddrmgr.BlockStamp) error {
 
 	if !errors.Is(listErr, db.ErrBlockNotFound) {
 		return listErr
@@ -663,10 +663,69 @@ func (s *syncer) resolveMissingHistoricalBlock(listErr error,
 	}
 
 	if syncedTo.Hash.IsEqual(remoteHash) {
-		return nil
+		return s.reconcileAheadConfirmations(ctx, syncedTo)
 	}
 
 	return listErr
+}
+
+// reconcileAheadConfirmations checks mined live observations independently of
+// scan progress. A surviving checkpoint does not validate later confirmations.
+func (s *syncer) reconcileAheadConfirmations(ctx context.Context,
+	checkpoint waddrmgr.BlockStamp) error {
+
+	heights, err := s.store.ListAheadConfirmationHeights(
+		ctx, s.walletID, checkpoint.Height,
+	)
+	if err != nil {
+		return fmt.Errorf("list confirmations ahead of checkpoint: %w", err)
+	}
+
+	if len(heights) == 0 {
+		return nil
+	}
+
+	sourceHash, sourceHeight, err := s.cfg.Chain.GetBestBlock()
+	if err != nil {
+		return fmt.Errorf("get source tip for ahead confirmations: %w", err)
+	}
+
+	source := waddrmgr.BlockStamp{Hash: *sourceHash, Height: sourceHeight}
+
+	tip, err := db.Int64ToUint32(int64(sourceHeight))
+	if err != nil {
+		return err
+	}
+
+	lowest, err := db.Int64ToUint32(int64(max(0, checkpoint.Height)))
+	if err != nil {
+		return err
+	}
+
+	if lowest > tip {
+		return ErrStateChanged
+	}
+
+	canonical := make(map[uint32]*chainhash.Hash, len(heights))
+	for _, height := range heights {
+		canonical[height] = nil
+	}
+
+	err = s.verifyDisconnectAncestry(
+		ctx, lowest, tip, checkpoint, source, canonical,
+	)
+	if err != nil {
+		return err
+	}
+
+	start, err := db.Int64ToUint32(int64(checkpoint.Height) + 1)
+	if err != nil {
+		return err
+	}
+
+	return s.store.ReconcileAheadConfirmations(
+		ctx, s.walletID, start, canonical,
+	)
 }
 
 // rewindWallet rewinds this wallet's sync and transaction state for a manual
@@ -1072,7 +1131,10 @@ func (s *syncer) putBlockNotifications(ctx context.Context,
 				"checkpoint: %w", ErrStateChanged)
 		}
 
-		return s.applyStoreTxBatch(ctx, matches, block, block)
+		synced := *block
+		synced.ParentHash = header.PrevBlock
+
+		return s.applyStoreTxBatch(ctx, matches, block, &synced)
 	}
 
 	// Empty supplemental payloads cannot add effects, so they need no
@@ -1517,7 +1579,9 @@ func (s *syncer) storeScanBatchParams(scanState *RecoveryState,
 		}
 
 		if includeSyncedBlocks {
-			params.SyncedBlocks = append(params.SyncedBlocks, *block)
+			synced := *block
+			synced.ParentHash = result.parentHash
+			params.SyncedBlocks = append(params.SyncedBlocks, synced)
 		}
 
 		if result.BlockProcessResult == nil {

@@ -90,10 +90,15 @@ func applyBatchSyncedBlocks(ctx context.Context, qtx *sqlc.Queries,
 			return fmt.Errorf("ensure synced block %d: %w", i, err)
 		}
 
-		syncParams := buildUpdateSyncParams(db.UpdateWalletParams{
-			WalletID: params.WalletID,
-			SyncedTo: block,
-		})
+		syncParams, err := buildUpdateSyncParams(
+			ctx, qtx, db.UpdateWalletParams{
+				WalletID: params.WalletID,
+				SyncedTo: block,
+			},
+		)
+		if err != nil {
+			return err
+		}
 
 		rowsAffected, err := qtx.UpdateWalletSyncState(ctx, syncParams)
 		if err != nil {
