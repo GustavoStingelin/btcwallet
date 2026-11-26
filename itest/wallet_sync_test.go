@@ -4,10 +4,21 @@ package itest
 
 import (
 	"bytes"
+	"context"
+	"fmt"
+	"sync/atomic"
+	"time"
 
 	"github.com/btcsuite/btcd/btcutil/v2"
+	"github.com/btcsuite/btcd/chainhash/v2"
+	"github.com/btcsuite/btcd/txscript/v2"
+	"github.com/btcsuite/btcd/wire/v2"
 	"github.com/btcsuite/btcwallet/bwtest"
+	"github.com/btcsuite/btcwallet/bwtest/wait"
+	"github.com/btcsuite/btcwallet/chain"
+	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/btcsuite/btcwallet/wallet"
+	"github.com/btcsuite/btcwallet/wtxmgr"
 	"github.com/stretchr/testify/require"
 )
 
@@ -206,4 +217,183 @@ func testWalletSyncRollback(h *bwtest.HarnessTest) {
 	reopenedConfirmed, err := w.ListUnspent(h.Context(), confirmedCoins)
 	require.NoError(h, err)
 	require.Equal(h, confirmed, reopenedConfirmed)
+}
+
+// testWalletSyncOfflineRollback proves startup recovery can walk a committed
+// branch when the Wallet missed every disconnect while offline.
+func testWalletSyncOfflineRollback(h *bwtest.HarnessTest) {
+	// Arrange: The losing branch has a payment and an empty block above it.
+	w, _ := h.NewWallet(bwtest.WalletFixture{})
+	competitor := h.SpawnTempMiner()
+	funding := h.FundWallet(w, oneBTC)
+	h.MineEmptyBlocks(1)
+
+	txid := funding.Tx.TxHash()
+	payment, err := w.GetTx(h.Context(), txid)
+	require.NoError(h, err)
+	require.Equal(h, int32(2), payment.Confirmations)
+
+	// Act: The winning miner replaces both blocks while the Store is closed.
+	w = h.ReloadWalletAfter(w, func() {
+		winning := competitor.MineEmptyBlocks(3)
+		h.ConnectToMiner(competitor)
+		h.WaitForMinerTip(
+			winning[len(winning)-1].BlockHash(), funding.BlockHeight+2,
+		)
+	})
+	h.AssertWalletSynced(w)
+
+	// Assert: Startup detached the payment and reached the new chain tip.
+	payment, err = w.GetTx(h.Context(), txid)
+	require.NoError(h, err)
+	require.Nil(h, payment.Block)
+	require.Zero(h, payment.Confirmations)
+
+	bestHash, bestHeight := h.GetBestBlock()
+	info, err := w.Info(h.Context())
+	require.NoError(h, err)
+	require.Equal(h, *bestHash, info.SyncedTo.Hash)
+	require.Equal(h, bestHeight, info.SyncedTo.Height)
+
+	// Finish with an empty mempool for the next harness case.
+	h.MineBlockWithTx(funding.Tx)
+}
+
+// sparsePaymentSource holds back scan progress and forwards only the mined
+// payment chosen by the test. All headers, filters and blocks still come from
+// the real chain backend.
+type sparsePaymentSource struct {
+	chain.Interface
+
+	events     chan any
+	checkpoint *chainhash.Hash
+	height     int32
+	frozen     atomic.Bool
+}
+
+// SubscribeChainEvents delivers only observations explicitly sent by the test.
+func (s *sparsePaymentSource) SubscribeChainEvents(
+	ctx context.Context) chain.EventSubscription {
+
+	done := make(chan struct{})
+	context.AfterFunc(ctx, func() {
+		close(s.events)
+		close(done)
+	})
+
+	return chain.EventSubscription{Events: s.events, Done: done}
+}
+
+// GetBestBlock lets the test keep the original worker at its known checkpoint.
+func (s *sparsePaymentSource) GetBestBlock() (*chainhash.Hash, int32, error) {
+	if s.frozen.Load() {
+		return s.checkpoint, s.height, nil
+	}
+
+	return s.Interface.GetBestBlock()
+}
+
+// waitForSourceTip checks that the node serving wallet reads has caught up
+// with the separate miner before the test delivers or reopens wallet work.
+func (s *sparsePaymentSource) waitForSourceTip(h *bwtest.HarnessTest,
+	hash chainhash.Hash, height int32) {
+
+	h.Helper()
+
+	err := wait.NoError(func() error {
+		bestHash, bestHeight, err := s.Interface.GetBestBlock()
+		if err != nil {
+			return err
+		}
+
+		if bestHeight != height || *bestHash != hash {
+			return fmt.Errorf("source tip %v at %d, want %v at %d",
+				bestHash, bestHeight, hash, height)
+		}
+
+		return nil
+	}, 10*time.Second)
+	require.NoError(h, err)
+}
+
+// testWalletSyncSparseRollback checks that a canonical checkpoint does not
+// validate a payment observed beyond it on a branch replaced while offline.
+func testWalletSyncSparseRollback(h *bwtest.HarnessTest) {
+	//nolint:staticcheck // Sparse startup recovery is a SQL Store capability.
+	if *dbBackend == string(wallet.DBBackendKVDB) {
+		h.Skip("sparse startup recovery requires a SQL backend")
+	}
+
+	// Arrange: Deliver the payment two heights ahead of the saved checkpoint,
+	// without delivering block progress or the intervening block.
+	fork, height := h.GetBestBlock()
+	source := &sparsePaymentSource{
+		Interface: h.ChainClient, events: make(chan any, 1),
+		checkpoint: fork, height: height,
+	}
+	source.waitForSourceTip(h, *fork, height)
+	h.ChainClient = source
+	w, _ := h.NewWallet(bwtest.WalletFixture{})
+	h.AssertWalletSynced(w)
+	source.frozen.Store(true)
+
+	competitor := h.SpawnTempMiner()
+	h.GenerateBlocks(1)
+
+	addrs := h.NewWalletAddressesOfType(w, waddrmgr.WitnessPubKey, 1)
+	script, err := txscript.PayToAddrScript(addrs[0])
+	require.NoError(h, err)
+	txid := h.SendOutput(
+		wire.NewTxOut(int64(oneBTC), script), bwtest.MinerFeeRate,
+	)
+	tx := h.AssertTxInMempool(*txid)
+	losingHash := h.GenerateBlocks(1)[0]
+	source.waitForSourceTip(h, *losingHash, height+2)
+	block, err := source.GetBlock(losingHash)
+	require.NoError(h, err)
+	h.AssertTxInBlock(block, *txid)
+	record, err := wtxmgr.NewTxRecordFromMsgTx(tx, block.Header.Timestamp)
+	require.NoError(h, err)
+
+	source.events <- chain.RelevantTx{
+		TxRecord: record,
+		Block: &wtxmgr.BlockMeta{
+			Block: wtxmgr.Block{Hash: *losingHash, Height: height + 2},
+			Time:  block.Header.Timestamp,
+		},
+	}
+
+	require.Eventually(h, func() bool {
+		payment, err := w.GetTx(h.Context(), *txid)
+
+		return err == nil && payment.Block != nil &&
+			payment.Block.Hash == *losingHash
+	}, 10*time.Second, wait.PollInterval)
+	info, err := w.Info(h.Context())
+	require.NoError(h, err)
+	require.Equal(h, *fork, info.SyncedTo.Hash)
+
+	// Act: Replace the payment block after shutdown, then reopen the same
+	// database against the real tip without delivering any disconnections.
+	w = h.ReloadWalletAfter(w, func() {
+		winning := competitor.MineEmptyBlocks(3)
+		h.ConnectToMiner(competitor)
+
+		tip := winning[2].BlockHash()
+		h.WaitForMinerTip(tip, height+3)
+		source.waitForSourceTip(h, tip, height+3)
+		h.ChainClient = source.Interface
+	})
+	h.AssertWalletSynced(w)
+	payment, err := w.GetTx(h.Context(), *txid)
+	require.NoError(h, err)
+
+	// Restore the miner's empty mempool without changing the captured wallet
+	// result. No wallet notification is needed for this cleanup.
+	h.AssertTxInMempool(*txid)
+	h.GenerateBlocks(1)
+
+	// Assert: Startup detached the abandoned confirmation.
+	require.Nil(h, payment.Block)
+	require.Zero(h, payment.Confirmations)
 }

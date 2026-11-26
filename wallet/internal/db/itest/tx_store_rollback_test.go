@@ -13,6 +13,62 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// TestScanLinksSparseConfirmation checks that a scan closes a missing parent
+// edge without copying the block or moving another wallet's checkpoint.
+func TestScanLinksSparseConfirmation(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	store := NewTestStore(t)
+	id := newWallet(t, store, "scan sparse")
+	sibling := newWallet(t, store, "observe sparse")
+	anchor, middle, mined := NewBlockFixture(98), NewBlockFixture(99),
+		NewBlockFixture(100)
+	middle.ParentHash, mined.ParentHash = anchor.Hash, middle.Hash
+
+	tx := newRegularTx(
+		[]wire.OutPoint{randomOutPoint()},
+		[]*wire.TxOut{{Value: 1000, PkScript: []byte{0x51}}},
+	)
+	for _, walletID := range []uint32{id, sibling} {
+		require.NoError(t, store.ApplyScanBatch(ctx, db.ScanBatchParams{
+			WalletID: walletID, SyncedBlocks: []db.Block{anchor},
+		}))
+		require.NoError(t, store.ApplyTxBatch(ctx, db.TxBatchParams{
+			WalletID: walletID,
+			Transactions: []db.CreateTxParams{{
+				WalletID: walletID, Tx: tx, Block: &mined,
+				Status: db.TxStatusPublished, Received: mined.Timestamp,
+			}},
+		}))
+	}
+
+	before, err := store.Queries().TreeBlockByHash(ctx, mined.Hash[:])
+	require.NoError(t, err)
+	require.False(t, before.ParentID.Valid)
+
+	require.ErrorIs(t, store.ApplyScanBatch(ctx, db.ScanBatchParams{
+		WalletID: id, SyncedBlocks: []db.Block{mined},
+	}), db.ErrBlockMismatch)
+	require.NoError(t, store.ApplyScanBatch(ctx, db.ScanBatchParams{
+		WalletID: id, SyncedBlocks: []db.Block{middle, mined},
+	}))
+
+	// The exact ID is retained; an orphan may still be shared by other
+	// wallets even when their scan progress follows a different path.
+	after, err := store.Queries().TreeBlockByHash(ctx, mined.Hash[:])
+	require.NoError(t, err)
+	parent, err := store.Queries().TreeBlockByHash(ctx, middle.Hash[:])
+	require.NoError(t, err)
+	require.Equal(t, before.ID, after.ID)
+	require.True(t, after.ParentID.Valid)
+	require.Equal(t, parent.ID, after.ParentID.Int64)
+
+	siblingInfo, err := store.GetWallet(ctx, "observe sparse")
+	require.NoError(t, err)
+	require.Equal(t, anchor.Hash, siblingInfo.SyncedTo.Hash)
+}
+
 // TestDisconnectBlockReconcilesMissingObservation verifies that an empty
 // disconnect can invalidate an older payment learned ahead of scan progress.
 func TestDisconnectBlockReconcilesMissingObservation(t *testing.T) {

@@ -177,6 +177,17 @@ func (h *HarnessTest) CreateTestAccount(w *wallet.Wallet,
 func (h *HarnessTest) ReloadWallet(current *wallet.Wallet) *wallet.Wallet {
 	h.Helper()
 
+	return h.ReloadWalletAfter(current, func() {})
+}
+
+// ReloadWalletAfter runs whileStopped after closing the current wallet's
+// Manager and Store, before opening and starting its replacement. It has the
+// same single-wallet and ownership requirements as ReloadWallet.
+func (h *HarnessTest) ReloadWalletAfter(current *wallet.Wallet,
+	whileStopped func()) *wallet.Wallet {
+
+	h.Helper()
+
 	require.NotNil(h, current, "cannot reload nil wallet")
 
 	h.mu.Lock()
@@ -216,6 +227,8 @@ func (h *HarnessTest) ReloadWallet(current *wallet.Wallet) *wallet.Wallet {
 	require.True(
 		h, h.ReleaseManager(manager), "failed to release wallet manager",
 	)
+
+	whileStopped()
 
 	manager = h.NewWalletManager()
 	wallets, err := manager.Start(ctx)
